@@ -1,0 +1,54 @@
+{
+  "type": "channel",
+  "name": "matrix",
+  "description": "Matrix Client-Server API channel for receiving and responding to Matrix messages",
+  "capabilities": {
+    "http": {
+      "allowlist": [
+        {
+          "host": "*",
+          "path_prefix": "/_matrix/client/"
+        }
+      ],
+      "credentials": {
+        "matrix_bot": {
+          "secret_name": "matrix_access_token",
+          "location": {
+            "type": "bearer"
+          },
+          "host_patterns": ["*"]
+        }
+      },
+      "rate_limit": {
+        "requests_per_minute": 30,
+        "requests_per_hour": 1000
+      }
+    },
+    "secrets": {
+      "allowed_names": ["matrix_*"]
+    },
+    "channel": {
+      "allowed_paths": ["/webhook/matrix"],
+      "allow_polling": true,
+      "min_poll_interval_ms": 1000,
+      "callback_timeout_secs": 45,
+      "workspace_prefix": "channels/matrix/",
+      "emit_rate_limit": {
+        "messages_per_minute": 100,
+        "messages_per_hour": 5000
+      }
+    }
+  },
+  "config": {
+    "homeserver": null,
+    "user_id": null,
+    "dm_policy": "pairing",
+    "allow_from": [],
+    "respond_to_all_group_messages": false,
+    "group_policy": "allowlist",
+    "groups": {},
+    "auto_join": "always",
+    "auto_join_allowlist": [],
+    "encryption": false
+  }
+}

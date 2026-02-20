@@ -2,6 +2,7 @@
 members = [".", "benchmarks"]
 exclude = [
     "channels-src/discord",
+    "channels-src/matrix",
     "channels-src/telegram",
     "channels-src/slack",
     "channels-src/whatsapp",
@@ -123,6 +124,11 @@ wasmtime = { version = "28", features = ["component-model"] }
 wasmtime-wasi = "28"  # WASI support for component model
 wasmparser = "0.220"  # WASM binary parsing for validation
 
+# Matrix E2EE (optional, behind matrix-e2ee feature flag)
+matrix-sdk-crypto = { version = "0.10", optional = true, default-features = false }
+vodozemac = { version = "0.9", optional = true }
+matrix-sdk-sqlite = { version = "0.10", optional = true, default-features = false }
+
 # Cryptography for secrets management
 aes-gcm = "0.10"
 hkdf = "0.12"
@@ -172,6 +178,7 @@ postgres = [
     "rust_decimal/db-tokio-postgres",
 ]
 libsql = ["dep:libsql"]
+matrix-e2ee = ["dep:matrix-sdk-crypto", "dep:vodozemac", "dep:matrix-sdk-sqlite"]
 integration = []
 
 # The profile that 'cargo dist' will build with

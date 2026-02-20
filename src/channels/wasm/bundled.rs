@@ -21,6 +21,7 @@ const KNOWN_CHANNELS: &[(&str, &str)] = &[
     ("telegram", "telegram_channel"),
     ("slack", "slack_channel"),
     ("whatsapp", "whatsapp_channel"),
+    ("matrix", "matrix_channel"),
 ];
 
 /// Names of known channels that can be installed.
@@ -130,11 +131,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_known_channels_includes_all_three() {
+    fn test_known_channels_includes_all() {
         let names = bundled_channel_names();
         assert!(names.contains(&"telegram"));
         assert!(names.contains(&"slack"));
         assert!(names.contains(&"whatsapp"));
+        assert!(names.contains(&"matrix"));
     }
 
     #[test]
