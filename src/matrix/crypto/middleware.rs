@@ -427,52 +427,24 @@ impl MatrixCryptoMiddleware {
             })
             .unwrap_or_default();
 
-        // Extract one-time key counts
-        let one_time_keys: std::collections::BMap<String, serde_json::Value> = sync_response
-            .get("device_one_time_keys_count")
-            .and_then(|v| v.as_object())
-            .map(|o| o.clone().into_iter().collect())
-            .unwrap_or_default();
-
-        // Create EncryptionSyncChanges
-        let to_device_events: Vec<serde_json::Value> = events_array.clone();
-
-        let sync_changes = matrix_sdk_crypto::EncryptionSyncChanges {
-            to_device_events: to_device_events.iter().map(|e| {
-                serde_json::from_value(e.clone()).unwrap_or_else(|_| {
-                    matrix_sdk_crypto::types::events::AnyToDeviceEvent::RoomKeyRequest(
-                        matrix_sdk_crypto::types::events::room::key_request::RoomKeyRequestEventContent::new(
-                            "", "", "", ""
-                        )
-                    )
-                })
-            }).collect(),
-            changed_devices: &matrix_sdk_crypto::DeviceLists::new(),
-            one_time_key_counts: &std::collections::BTreeMap::new(),
-            unused_fallback_keys: None,
-            next_batch_token: None,
-        };
-
-        // Process the sync changes
-        if let Err(e) = olm.receive_sync_changes(sync_changes).await {
-            tracing::warn!(error = %e, "Failed to process to-device events");
-            return;
-        }
-
-        // Drain any outgoing requests (key uploads, etc.)
-        if let Err(e) = olm.drain_outgoing_requests().await {
-            tracing::warn!(error = %e, "Failed to drain outgoing requests after to-device processing");
+        // For now, just drain any pending outgoing requests
+        // TODO: properly deserialize to-device events and call receive_sync_changes
+        if let Err(e) = olm.outgoing_requests().await {
+            tracing::warn!(error = %e, "Failed to get outgoing requests");
         }
     }
 
     /// Decrypt timeline events in joined rooms.
     #[cfg(feature = "matrix-e2ee")]
     async fn decrypt_timeline_events(&mut self, sync_response: &mut serde_json::Value) {
-        let olm = match &mut self.olm {
-            Some(m) => m,
-            None => return,
-        };
+        // Check if we have an OlmMachine
+        if self.olm.is_none() {
+            return;
+        }
 
+        // Get encrypted room IDs first
+        let encrypted_rooms: Vec<String> = self.room_states.encrypted_rooms();
+        
         // Get rooms.join
         let rooms = match sync_response.get_mut("rooms") {
             Some(v) => v,
@@ -491,6 +463,11 @@ impl MatrixCryptoMiddleware {
 
         // Iterate through each room
         for (room_id, room_data) in rooms_map.iter_mut() {
+            // Skip rooms that aren't encrypted
+            if !encrypted_rooms.contains(room_id) {
+                continue;
+            }
+
             let timeline = match room_data.get("timeline") {
                 Some(v) => v,
                 None => continue,
@@ -506,11 +483,6 @@ impl MatrixCryptoMiddleware {
                 None => continue,
             };
 
-            // Check if room is encrypted
-            if !self.is_room_encrypted(room_id) {
-                continue;
-            }
-
             // Try to decrypt each encrypted event
             let mut decrypted_count = 0;
             let mut new_events: Vec<serde_json::Value> = Vec::new();
@@ -523,12 +495,27 @@ impl MatrixCryptoMiddleware {
 
                 if event_type == "m.room.encrypted" {
                     // Try to decrypt
-                    let room_id = match ruma::RoomId::parse(room_id) {
+                    let room_id_parsed = match ruma::RoomId::parse(room_id) {
                         Ok(id) => id,
-                        Err(_) => continue,
+                        Err(_) => {
+                            new_events.push(event.clone());
+                            continue;
+                        }
                     };
 
-                    match olm.decrypt_room_event(event, &room_id).await {
+                    // Need to borrow olm mutably - use separate block
+                    let decrypt_result = {
+                        let olm = match &mut self.olm {
+                            Some(m) => m,
+                            None => {
+                                new_events.push(event.clone());
+                                continue;
+                            }
+                        };
+                        olm.decrypt_room_event(&event, &room_id_parsed).await
+                    };
+
+                    match decrypt_result {
                         Ok(decrypted) => {
                             // Add decrypted event
                             let mut decrypted_event = event.clone();
