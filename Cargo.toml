@@ -125,9 +125,10 @@ wasmtime-wasi = "28"  # WASI support for component model
 wasmparser = "0.220"  # WASM binary parsing for validation
 
 # Matrix E2EE (optional, behind matrix-e2ee feature flag)
-matrix-sdk-crypto = { version = "0.10", optional = true, default-features = false }
-vodozemac = { version = "0.9", optional = true }
-matrix-sdk-sqlite = { version = "0.10", optional = true, default-features = false }
+# Use matrix-sdk-crypto + matrix-sdk-sqlite directly (avoids compiling the full Client)
+matrix-sdk-crypto = { version = "0.16", optional = true, default-features = false }
+matrix-sdk-sqlite = { version = "0.16", optional = true, default-features = false, features = ["crypto-store"] }
+ruma = { version = "0.14", optional = true, default-features = false, features = ["client-api-c"] }
 
 # Cryptography for secrets management
 aes-gcm = "0.10"
@@ -178,7 +179,7 @@ postgres = [
     "rust_decimal/db-tokio-postgres",
 ]
 libsql = ["dep:libsql"]
-matrix-e2ee = ["dep:matrix-sdk-crypto", "dep:vodozemac", "dep:matrix-sdk-sqlite"]
+matrix-e2ee = ["dep:matrix-sdk-crypto", "dep:matrix-sdk-sqlite", "dep:ruma"]
 integration = []
 
 # The profile that 'cargo dist' will build with

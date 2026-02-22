@@ -53,6 +53,9 @@ use crate::safety::LeakDetector;
 use crate::tools::wasm::LogLevel;
 use crate::tools::wasm::WasmResourceLimiter;
 
+#[cfg(feature = "matrix-e2ee")]
+use crate::matrix::{MatrixCryptoConfig, MatrixCryptoMiddleware};
+
 // Generate component model bindings from the WIT file
 wasmtime::component::bindgen!({
     path: "wit/channel.wit",
@@ -79,6 +82,9 @@ struct ChannelStoreData {
     /// Dedicated tokio runtime for HTTP requests, lazily initialized.
     /// Reused across multiple `http_request` calls within one execution.
     http_runtime: Option<tokio::runtime::Runtime>,
+    /// Matrix E2EE crypto middleware, if enabled and configured.
+    #[cfg(feature = "matrix-e2ee")]
+    crypto_middleware: Option<MatrixCryptoMiddleware>,
 }
 
 impl ChannelStoreData {
@@ -100,7 +106,27 @@ impl ChannelStoreData {
             credentials,
             pairing_store,
             http_runtime: None,
+            #[cfg(feature = "matrix-e2ee")]
+            crypto_middleware: None,
         }
+    }
+
+    /// Set the Matrix crypto middleware for this channel.
+    #[cfg(feature = "matrix-e2ee")]
+    pub fn set_crypto_middleware(&mut self, middleware: MatrixCryptoMiddleware) {
+        self.crypto_middleware = Some(middleware);
+    }
+
+    /// Get a reference to the crypto middleware, if available.
+    #[cfg(feature = "matrix-e2ee")]
+    pub fn crypto_middleware(&self) -> Option<&MatrixCryptoMiddleware> {
+        self.crypto_middleware.as_ref()
+    }
+
+    /// Get a mutable reference to the crypto middleware, if available.
+    #[cfg(feature = "matrix-e2ee")]
+    pub fn crypto_middleware_mut(&mut self) -> Option<&mut MatrixCryptoMiddleware> {
+        self.crypto_middleware.as_mut()
     }
 
     /// Inject credentials into a string by replacing placeholders.

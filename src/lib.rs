@@ -54,6 +54,9 @@ pub mod extensions;
 pub mod history;
 pub mod hooks;
 pub mod llm;
+
+#[cfg(feature = "matrix-e2ee")]
+pub mod matrix;
 pub mod observability;
 pub mod orchestrator;
 pub mod pairing;
