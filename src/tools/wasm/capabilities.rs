@@ -235,6 +235,11 @@ impl EndpointPattern {
 
     /// Check if host pattern matches (public for allowlist validation).
     pub fn host_matches(&self, url_host: &str) -> bool {
+        // Bare wildcard matches any host
+        if self.host == "*" {
+            return true;
+        }
+
         if self.host == url_host {
             return true;
         }
