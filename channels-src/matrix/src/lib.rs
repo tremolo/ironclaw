@@ -280,6 +280,14 @@ impl Guest for MatrixChannel {
             return;
         }
 
+        channel_host::log(
+            channel_host::LogLevel::Debug,
+            &format!(
+                "Sync response body: {}",
+                String::from_utf8_lossy(&response.body)
+            ),
+        );
+
         let sync: SyncResponse = match serde_json::from_slice(&response.body) {
             Ok(s) => s,
             Err(e) => {
@@ -321,8 +329,22 @@ impl Guest for MatrixChannel {
         }
 
         if let Some(rooms) = &sync.rooms {
+            channel_host::log(
+                channel_host::LogLevel::Info,
+                &format!("Sync has rooms data: {} joined rooms", rooms.join.len()),
+            );
+
             // Process joined rooms
             for (room_id, room) in &rooms.join {
+                channel_host::log(
+                    channel_host::LogLevel::Debug,
+                    &format!(
+                        "Processing room {} - is_direct={}",
+                        room_id,
+                        is_dm_room(room_id, room, &dm_rooms)
+                    ),
+                );
+
                 // Update DM rooms from per-room account_data
                 if let Some(account_data) = &room.account_data {
                     update_dm_rooms_from_account_data(account_data, &mut dm_rooms);
@@ -334,7 +356,24 @@ impl Guest for MatrixChannel {
                 }
 
                 if let Some(timeline) = &room.timeline {
+                    channel_host::log(
+                        channel_host::LogLevel::Debug,
+                        &format!(
+                            "Room {} has {} timeline events",
+                            room_id,
+                            timeline.events.len()
+                        ),
+                    );
                     for event in &timeline.events {
+                        channel_host::log(
+                            channel_host::LogLevel::Debug,
+                            &format!(
+                                "Timeline event: type={} from={} body={:?}",
+                                event.event_type,
+                                event.sender,
+                                event.content.get("body")
+                            ),
+                        );
                         process_timeline_event(
                             event,
                             room_id,
@@ -819,8 +858,9 @@ fn initialize_user(homeserver: &str) -> Option<String> {
     // Fetch display name
     let url = format!(
         "{}/_matrix/client/v3/profile/{}/displayname?access_token={{{}}}",
-        homeserver, 
-        url_encode(&whoami.user_id),"MATRIX_ACCESS_TOKEN"
+        homeserver,
+        url_encode(&whoami.user_id),
+        "MATRIX_ACCESS_TOKEN"
     );
     if let Ok(r) = channel_host::http_request("GET", &url, "{}", None, None) {
         if r.status == 200 {
