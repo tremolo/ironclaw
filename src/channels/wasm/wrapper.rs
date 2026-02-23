@@ -418,50 +418,57 @@ impl near::agent::channel_host::Host for ChannelStoreData {
             }
 
             // Process response through crypto middleware if enabled (for Matrix E2EE decryption)
+            // Note: We cannot use nested block_on() here - we're already inside an async context
+            // running in rt.block_on(). We use a separate thread with its own runtime to do crypto.
             #[cfg(feature = "matrix-e2ee")]
             let body = {
-                // Check if this is a Matrix sync response that needs decryption
                 let needs_crypto = url.contains("/_matrix/client/") && url.contains("/sync");
                 
                 if needs_crypto {
-                    // Clone crypto_state for async operation
                     let crypto_state_clone = self.crypto_state.clone();
                     let url_clone = url.clone();
                     let body_clone = body.clone();
+                    let status = status;
                     
-                    // Process in async context
-                    let processed = rt.block_on(async {
-                        let crypto_guard = crypto_state_clone.read().await;
-                        if let Some(middleware) = crypto_guard.as_ref() {
-                            // Clone middleware for mutation (or use Arc<Mutex> pattern)
-                            // For now, we need to make a mutable copy or use interior mutability
-                            drop(crypto_guard);
-                            let mut crypto_guard = crypto_state_clone.write().await;
-                            let _body_clone_err = body_clone.clone();
-                            if let Some(middleware) = crypto_guard.as_mut() {
-                                match middleware.intercept_response(&url_clone, status, Some(body_clone)).await {
-                                    crate::matrix::crypto::types::CryptoProcessResult::Processed((new_status, new_body)) => {
-                                        tracing::info!(
-                                            "Crypto middleware processed sync response: {} -> {} bytes",
-                                            _body_clone_err.len(),
-                                            new_body.as_ref().map(|b| b.len()).unwrap_or(0)
-                                        );
-                                        return new_body;
-                                    }
-                                    crate::matrix::crypto::types::CryptoProcessResult::PassThrough((_, pass_body)) => {
-                                        return pass_body;
-                                    }
-                                    crate::matrix::crypto::types::CryptoProcessResult::Error(e) => {
-                                        tracing::warn!("Crypto middleware error: {}", e);
-                                        return Some(_body_clone_err);
-                                    }
+                    // Spawn a separate thread to do crypto processing
+                    // This avoids nested runtime issues
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().unwrap();
+                        let result = rt.block_on(async {
+                            let crypto_guard = crypto_state_clone.read().await;
+                            if let Some(middleware) = crypto_guard.as_ref() {
+                                drop(crypto_guard);
+                                let mut crypto_guard = crypto_state_clone.write().await;
+                                if let Some(middleware) = crypto_guard.as_mut() {
+                                    return middleware.intercept_response(&url_clone, status, Some(body_clone)).await;
                                 }
                             }
-                        }
-                        Some(body_clone)
+                            // Return pass-through if no middleware
+                            crate::matrix::crypto::types::CryptoProcessResult::PassThrough((status, Some(body_clone)))
+                        });
+                        let _ = tx.send(result);
                     });
                     
-                    processed.unwrap_or(body)
+                    // Wait for the result
+                    if let Ok(result) = rx.recv() {
+                        match result {
+                            crate::matrix::crypto::types::CryptoProcessResult::Processed((_, new_body)) => {
+                                tracing::info!("Crypto middleware processed sync response");
+                                new_body.unwrap_or(body)
+                            }
+                            crate::matrix::crypto::types::CryptoProcessResult::PassThrough((_, pass_body)) => {
+                                pass_body.unwrap_or(body)
+                            }
+                            crate::matrix::crypto::types::CryptoProcessResult::Error(e) => {
+                                tracing::warn!("Crypto middleware error: {}", e);
+                                body
+                            }
+                        }
+                    } else {
+                        body
+                    }
                 } else {
                     body
                 }
