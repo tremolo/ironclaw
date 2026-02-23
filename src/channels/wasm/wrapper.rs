@@ -417,6 +417,55 @@ impl near::agent::channel_host::Host for ChannelStoreData {
                 tracing::debug!(body = %truncated, "Response body");
             }
 
+            // Process response through crypto middleware if enabled (for Matrix E2EE decryption)
+            #[cfg(feature = "matrix-e2ee")]
+            let body = {
+                // Check if this is a Matrix sync response that needs decryption
+                let needs_crypto = url.contains("/_matrix/client/") && url.contains("/sync");
+                
+                if needs_crypto {
+                    // Clone crypto_state for async operation
+                    let crypto_state_clone = self.crypto_state.clone();
+                    let url_clone = url.clone();
+                    let body_clone = body.clone();
+                    
+                    // Process in async context
+                    let processed = rt.block_on(async {
+                        let crypto_guard = crypto_state_clone.read().await;
+                        if let Some(middleware) = crypto_guard.as_ref() {
+                            // Clone middleware for mutation (or use Arc<Mutex> pattern)
+                            // For now, we need to make a mutable copy or use interior mutability
+                            drop(crypto_guard);
+                            let mut crypto_guard = crypto_state_clone.write().await;
+                            if let Some(middleware) = crypto_guard.as_mut() {
+                                match middleware.intercept_response(&url_clone, status, Some(body_clone)).await {
+                                    crate::matrix::crypto::types::CryptoProcessResult::Processed((new_status, new_body)) => {
+                                        tracing::info!(
+                                            "Crypto middleware processed sync response: {} -> {} bytes",
+                                            body_clone.len(),
+                                            new_body.as_ref().map(|b| b.len()).unwrap_or(0)
+                                        );
+                                        return new_body;
+                                    }
+                                    crate::matrix::crypto::types::CryptoProcessResult::PassThrough((_, pass_body)) => {
+                                        return pass_body;
+                                    }
+                                    crate::matrix::crypto::types::CryptoProcessResult::Error(e) => {
+                                        tracing::warn!("Crypto middleware error: {}", e);
+                                        return Some(body_clone);
+                                    }
+                                }
+                            }
+                        }
+                        Some(body_clone)
+                    });
+                    
+                    processed.unwrap_or(body)
+                } else {
+                    body
+                }
+            };
+
             // Leak detection on response body (best-effort)
             if let Ok(body_str) = std::str::from_utf8(&body) {
                 leak_detector
