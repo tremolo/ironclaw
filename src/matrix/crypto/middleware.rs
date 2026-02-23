@@ -350,6 +350,12 @@ impl MatrixCryptoMiddleware {
         status: u16,
         body: Option<Vec<u8>>,
     ) -> CryptoProcessResult<(u16, Option<Vec<u8>>)> {
+        tracing::debug!(
+            status = status,
+            body_len = body.as_ref().map(|b| b.len()).unwrap_or(0),
+            "Processing Matrix sync response"
+        );
+
         let body = match body {
             Some(b) => b,
             None => return CryptoProcessResult::PassThrough((status, None)),
@@ -423,6 +429,11 @@ impl MatrixCryptoMiddleware {
             return;
         }
 
+        tracing::debug!(
+            to_device_count = events_array.len(),
+            "Processing to-device events for key exchange"
+        );
+
         // Extract device list changes
         let device_lists = sync_response.get("device_lists");
         let changed: Vec<String> = device_lists
@@ -444,6 +455,14 @@ impl MatrixCryptoMiddleware {
                     .collect()
             })
             .unwrap_or_default();
+
+        if !changed.is_empty() {
+            tracing::debug!(changed_count = changed.len(), "Device lists changed");
+        }
+
+        if !left.is_empty() {
+            tracing::debug!(left_count = left.len(), "Device lists left");
+        }
 
         // For now, just drain any pending outgoing requests
         // TODO: properly deserialize to-device events and call receive_sync_changes

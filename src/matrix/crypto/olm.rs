@@ -151,13 +151,22 @@ impl OlmMachineWrapper {
     ) -> Result<(), anyhow::Error> {
         use matrix_sdk_crypto::{DecryptionSettings, TrustRequirement};
         
+        tracing::debug!(
+            to_device_count = sync_changes.to_device_events.len(),
+            changed_devices = sync_changes.changed_devices.changed.len(),
+            left_devices = sync_changes.changed_devices.left.len(),
+            one_time_keys_count = sync_changes.one_time_keys_counts.len(),
+            "Processing sync crypto changes"
+        );
+        
         let settings = DecryptionSettings {
             sender_device_trust_requirement: TrustRequirement::Untrusted,
         };
         let (_to_device_events, _room_key_updates) =
             self.machine.receive_sync_changes(sync_changes, &settings).await?;
 
-        tracing::debug!(
+        tracing::info!(
+            to_device_processed = _to_device_events.len(),
             room_key_updates = _room_key_updates.len(),
             "Processed sync crypto changes"
         );
@@ -178,6 +187,12 @@ impl OlmMachineWrapper {
         use ruma::serde::Raw;
         use ruma::events::AnyMessageLikeEventContent;
 
+        tracing::debug!(
+            room_id = %room_id,
+            event_type = %event_type,
+            "Encrypting room event"
+        );
+
         let raw_content: Raw<AnyMessageLikeEventContent> =
             Raw::from_json(serde_json::value::to_raw_value(content)?);
 
@@ -187,6 +202,12 @@ impl OlmMachineWrapper {
             .await?;
 
         let encrypted_value: serde_json::Value = encrypted.deserialize_as()?;
+
+        tracing::info!(
+            room_id = %room_id,
+            event_type = %event_type,
+            "Successfully encrypted room event"
+        );
 
         Ok(EncryptedMessage {
             event_type: "m.room.encrypted".to_string(),
@@ -213,10 +234,26 @@ impl OlmMachineWrapper {
             sender_device_trust_requirement: TrustRequirement::Untrusted,
         };
 
-        let decrypted = self
+        tracing::debug!(
+            room_id = %room_id,
+            "Decrypting room event"
+        );
+
+        let decrypted = match self
             .machine
             .decrypt_room_event(&raw_event, room_id, &settings)
-            .await?;
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    room_id = %room_id,
+                    error = %e,
+                    "Failed to decrypt room event"
+                );
+                return Err(e.into());
+            }
+        };
 
         let event_json_str = decrypted.event.json().get();
         let event_json: serde_json::Value = serde_json::from_str(event_json_str)?;
@@ -235,6 +272,13 @@ impl OlmMachineWrapper {
             .unwrap_or("")
             .to_string();
 
+        tracing::info!(
+            room_id = %room_id,
+            event_type = %event_type,
+            sender = %sender,
+            "Successfully decrypted room event"
+        );
+
         Ok(DecryptedMessage {
             event_type,
             content,
@@ -252,6 +296,12 @@ impl OlmMachineWrapper {
         users: &[&ruma::UserId],
     ) -> Result<(), anyhow::Error> {
         use matrix_sdk_crypto::EncryptionSettings;
+
+        tracing::info!(
+            room_id = %room_id,
+            user_count = users.len(),
+            "Sharing room key with users"
+        );
 
         let settings = EncryptionSettings::default();
         let requests = self
@@ -277,12 +327,24 @@ impl OlmMachineWrapper {
         &self,
         users: &[&ruma::UserId],
     ) -> Result<bool, anyhow::Error> {
+        tracing::debug!(
+            user_count = users.len(),
+            "Checking for missing Olm sessions"
+        );
+
         let result = self
             .machine
             .get_missing_sessions(users.iter().copied())
             .await?;
 
-        Ok(result.is_some())
+        let has_missing = result.is_some();
+        if has_missing {
+            tracing::info!("Missing sessions found, key claim required");
+        } else {
+            tracing::debug!("All sessions established");
+        }
+
+        Ok(has_missing)
     }
 
     /// Mark users as tracked for device key updates.
@@ -292,7 +354,14 @@ impl OlmMachineWrapper {
         &self,
         users: &[&ruma::UserId],
     ) -> Result<(), anyhow::Error> {
+        tracing::debug!(
+            user_count = users.len(),
+            "Updating tracked users for device keys"
+        );
+
         self.machine.update_tracked_users(users.iter().copied()).await?;
+
+        tracing::debug!("Tracked users updated successfully");
         Ok(())
     }
 }
