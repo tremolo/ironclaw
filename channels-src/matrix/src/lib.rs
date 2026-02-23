@@ -818,9 +818,9 @@ fn initialize_user(homeserver: &str) -> Option<String> {
 
     // Fetch display name
     let url = format!(
-        "{}/_matrix/client/v3/profile/{}/displayname",
-        homeserver,
-        url_encode(&whoami.user_id),
+        "{}/_matrix/client/v3/profile/{}/displayname?access_token={{{}}}",
+        homeserver, 
+        url_encode(&whoami.user_id),"MATRIX_ACCESS_TOKEN"
     );
     if let Ok(r) = channel_host::http_request("GET", &url, "{}", None, None) {
         if r.status == 200 {
@@ -862,7 +862,10 @@ fn update_dm_rooms_from_account_data(account_data: &AccountData, dm_rooms: &mut 
 }
 
 fn build_sync_url(homeserver: &str, token: Option<&str>, timeout: u64) -> String {
-    let mut url = format!("{}/_matrix/client/v3/sync?timeout={}", homeserver, timeout);
+    let mut url = format!(
+        "{}/_matrix/client/v3/sync?timeout={}&access_token={{{}}}",
+        homeserver, timeout, "MATRIX_ACCESS_TOKEN",
+    );
     if let Some(t) = token {
         url.push_str(&format!("&since={}", t));
     }
