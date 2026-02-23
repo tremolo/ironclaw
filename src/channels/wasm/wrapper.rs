@@ -437,12 +437,13 @@ impl near::agent::channel_host::Host for ChannelStoreData {
                             // For now, we need to make a mutable copy or use interior mutability
                             drop(crypto_guard);
                             let mut crypto_guard = crypto_state_clone.write().await;
+                            let _body_clone_err = body_clone.clone();
                             if let Some(middleware) = crypto_guard.as_mut() {
                                 match middleware.intercept_response(&url_clone, status, Some(body_clone)).await {
                                     crate::matrix::crypto::types::CryptoProcessResult::Processed((new_status, new_body)) => {
                                         tracing::info!(
                                             "Crypto middleware processed sync response: {} -> {} bytes",
-                                            body_clone.len(),
+                                            _body_clone_err.len(),
                                             new_body.as_ref().map(|b| b.len()).unwrap_or(0)
                                         );
                                         return new_body;
@@ -452,7 +453,7 @@ impl near::agent::channel_host::Host for ChannelStoreData {
                                     }
                                     crate::matrix::crypto::types::CryptoProcessResult::Error(e) => {
                                         tracing::warn!("Crypto middleware error: {}", e);
-                                        return Some(body_clone);
+                                        return Some(_body_clone_err);
                                     }
                                 }
                             }
