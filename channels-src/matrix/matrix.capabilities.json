@@ -40,6 +40,13 @@
       }
     }
   },
+  "auth": {
+    "secret_name": "matrix_access_token",
+    "display_name": "Matrix Bot",
+    "instructions": "Enter your Matrix access token. You can obtain one by logging in with your bot account via Element or by calling POST /_matrix/client/v3/login on your homeserver.",
+    "token_hint": "Starts with 'syt_' or 'md' depending on homeserver",
+    "env_var": "MATRIX_ACCESS_TOKEN"
+  },
   "config": {
     "homeserver": null,
     "user_id": null,
