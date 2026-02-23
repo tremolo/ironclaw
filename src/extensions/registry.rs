@@ -1,7 +1,7 @@
 //! Curated in-memory catalog of known extensions with fuzzy search.
 //!
-//! The registry holds well-known MCP servers and WASM tools that can be installed
-//! via conversational commands. Online discoveries are cached here too.
+//! The registry holds well-known channels, tools, and MCP servers that can be
+//! installed via conversational commands. Online discoveries are cached here too.
 
 use tokio::sync::RwLock;
 
@@ -22,6 +22,26 @@ impl ExtensionRegistry {
     pub fn new() -> Self {
         Self {
             entries: builtin_entries(),
+            discovery_cache: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// Create a new registry merging builtin entries with catalog-provided entries.
+    ///
+    /// Deduplicates by `(name, kind)` pair -- a builtin MCP "slack" and a registry
+    /// WASM "slack" can coexist since they're different kinds.
+    pub fn new_with_catalog(catalog_entries: Vec<RegistryEntry>) -> Self {
+        let mut entries = builtin_entries();
+        for entry in catalog_entries {
+            if !entries
+                .iter()
+                .any(|e| e.name == entry.name && e.kind == entry.kind)
+            {
+                entries.push(entry);
+            }
+        }
+        Self {
+            entries,
             discovery_cache: RwLock::new(Vec::new()),
         }
     }
@@ -94,6 +114,21 @@ impl ExtensionRegistry {
         }
         let cache = self.discovery_cache.read().await;
         cache.iter().find(|e| e.name == name).cloned()
+    }
+
+    /// Return all registry entries (builtins + cached discoveries).
+    pub async fn all_entries(&self) -> Vec<RegistryEntry> {
+        let mut entries = self.entries.clone();
+        let cache = self.discovery_cache.read().await;
+        for entry in cache.iter() {
+            if !entries
+                .iter()
+                .any(|e| e.name == entry.name && e.kind == entry.kind)
+            {
+                entries.push(entry.clone());
+            }
+        }
+        entries
     }
 
     /// Add discovered entries to the cache.
@@ -250,11 +285,11 @@ fn builtin_entries() -> Vec<RegistryEntry> {
             auth_hint: AuthHint::Dcr,
         },
         RegistryEntry {
-            name: "slack".to_string(),
-            display_name: "Slack".to_string(),
+            name: "slack-mcp".to_string(),
+            display_name: "Slack MCP".to_string(),
             kind: ExtensionKind::McpServer,
             description:
-                "Connect to Slack for messaging, channel management, and team communication"
+                "Connect to Slack via MCP for messaging, channel management, and team communication"
                     .to_string(),
             keywords: vec![
                 "messaging".into(),
@@ -360,6 +395,9 @@ fn builtin_entries() -> Vec<RegistryEntry> {
             },
             auth_hint: AuthHint::Dcr,
         },
+        // WASM channels (telegram, slack, discord, whatsapp) come from the embedded
+        // registry catalog (registry/channels/*.json) with WasmDownload URLs pointing
+        // to GitHub release artifacts. See new_with_catalog() for merging.
     ]
 }
 
@@ -542,4 +580,81 @@ mod tests {
         let results = registry.search("dup").await;
         assert_eq!(results.len(), 1, "Should not duplicate cached entries");
     }
+
+    #[tokio::test]
+    async fn test_new_with_catalog() {
+        let catalog_entries = vec![
+            RegistryEntry {
+                name: "telegram".to_string(),
+                display_name: "Telegram".to_string(),
+                kind: ExtensionKind::WasmChannel,
+                description: "Telegram Bot API channel".to_string(),
+                keywords: vec!["messaging".into(), "bot".into()],
+                source: ExtensionSource::WasmBuildable {
+                    repo_url: "channels-src/telegram".to_string(),
+                    build_dir: Some("channels-src/telegram".to_string()),
+                    crate_name: Some("telegram-channel".to_string()),
+                },
+                auth_hint: AuthHint::CapabilitiesAuth,
+            },
+            // This shares a name with the builtin slack-mcp but has a different kind, so both should appear
+            RegistryEntry {
+                name: "slack-mcp".to_string(),
+                display_name: "Slack MCP WASM".to_string(),
+                kind: ExtensionKind::WasmTool,
+                description: "Slack WASM tool".to_string(),
+                keywords: vec!["messaging".into()],
+                source: ExtensionSource::WasmBuildable {
+                    repo_url: "tools-src/slack".to_string(),
+                    build_dir: Some("tools-src/slack".to_string()),
+                    crate_name: Some("slack-tool".to_string()),
+                },
+                auth_hint: AuthHint::CapabilitiesAuth,
+            },
+        ];
+
+        let registry = ExtensionRegistry::new_with_catalog(catalog_entries);
+
+        // Should find the new telegram entry
+        let results = registry.search("telegram").await;
+        assert!(!results.is_empty(), "Should find telegram from catalog");
+        assert_eq!(results[0].entry.name, "telegram");
+
+        // Should have both builtin MCP slack-mcp and catalog WASM slack-mcp
+        let results = registry.search("slack").await;
+        let slack_mcp = results
+            .iter()
+            .any(|r| r.entry.name == "slack-mcp" && r.entry.kind == ExtensionKind::McpServer);
+        let slack_wasm = results
+            .iter()
+            .any(|r| r.entry.name == "slack-mcp" && r.entry.kind == ExtensionKind::WasmTool);
+        assert!(slack_mcp, "Should have builtin MCP slack-mcp");
+        assert!(slack_wasm, "Should have catalog WASM slack-mcp");
+    }
+
+    #[tokio::test]
+    async fn test_new_with_catalog_dedup_same_kind() {
+        // A catalog entry with same name AND kind as a builtin should be skipped
+        let catalog_entries = vec![RegistryEntry {
+            name: "slack-mcp".to_string(),
+            display_name: "Slack MCP Override".to_string(),
+            kind: ExtensionKind::McpServer, // same kind as builtin slack-mcp
+            description: "Should be skipped".to_string(),
+            keywords: vec![],
+            source: ExtensionSource::McpUrl {
+                url: "https://other.slack.com".to_string(),
+            },
+            auth_hint: AuthHint::Dcr,
+        }];
+
+        let registry = ExtensionRegistry::new_with_catalog(catalog_entries);
+
+        let entry = registry.get("slack-mcp").await;
+        assert!(entry.is_some());
+        // Should still be the builtin, not the override
+        assert_eq!(entry.unwrap().display_name, "Slack MCP");
+    }
+
+    // Channel tests (telegram, slack, discord, whatsapp) require the embedded catalog
+    // to be loaded via new_with_catalog(). See test_new_with_catalog for catalog coverage.
 }

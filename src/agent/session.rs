@@ -70,10 +70,9 @@ impl Session {
     pub fn create_thread(&mut self) -> &mut Thread {
         let thread = Thread::new(self.id);
         let thread_id = thread.id;
-        self.threads.insert(thread_id, thread);
         self.active_thread = Some(thread_id);
         self.last_active_at = Utc::now();
-        self.threads.get_mut(&thread_id).expect("just inserted")
+        self.threads.entry(thread_id).or_insert(thread)
     }
 
     /// Get the active thread.
@@ -88,10 +87,19 @@ impl Session {
 
     /// Get or create the active thread.
     pub fn get_or_create_thread(&mut self) -> &mut Thread {
-        if self.active_thread.is_none() {
-            self.create_thread();
+        match self.active_thread {
+            None => self.create_thread(),
+            Some(id) => {
+                if self.threads.contains_key(&id) {
+                    // Safe: contains_key confirmed the entry exists.
+                    self.threads.get_mut(&id).unwrap()
+                } else {
+                    // Stale active_thread ID: create a new thread, which
+                    // updates self.active_thread to the new thread's ID.
+                    self.create_thread()
+                }
+            }
         }
-        self.active_thread_mut().expect("just created")
     }
 
     /// Switch to a different thread.
@@ -177,10 +185,6 @@ pub struct Thread {
     /// Pending auth token request (thread is in auth mode).
     #[serde(default)]
     pub pending_auth: Option<PendingAuth>,
-    /// Last NEAR AI response ID for response chaining. Persisted to DB
-    /// metadata so we can resume chaining across restarts.
-    #[serde(default)]
-    pub last_response_id: Option<String>,
 }
 
 impl Thread {
@@ -197,7 +201,6 @@ impl Thread {
             metadata: serde_json::Value::Null,
             pending_approval: None,
             pending_auth: None,
-            last_response_id: None,
         }
     }
 
@@ -214,7 +217,6 @@ impl Thread {
             metadata: serde_json::Value::Null,
             pending_approval: None,
             pending_auth: None,
-            last_response_id: None,
         }
     }
 
@@ -240,7 +242,8 @@ impl Thread {
         self.turns.push(turn);
         self.state = ThreadState::Processing;
         self.updated_at = Utc::now();
-        self.turns.last_mut().expect("just pushed")
+        // turn_number was len() before push, so it's a valid index after push
+        &mut self.turns[turn_number]
     }
 
     /// Complete the current turn with a response.
@@ -353,8 +356,10 @@ impl Thread {
                 if let Some(next) = iter.peek()
                     && next.role == crate::llm::Role::Assistant
                 {
-                    let response = iter.next().expect("peeked");
-                    turn.complete(&response.content);
+                    // iter.next() is guaranteed Some after a successful peek()
+                    if let Some(response) = iter.next() {
+                        turn.complete(&response.content);
+                    }
                 }
 
                 self.turns.push(turn);
@@ -852,7 +857,6 @@ mod tests {
 
         thread.start_turn("hello");
         thread.complete_turn("world");
-        thread.last_response_id = Some("resp_abc123".to_string());
 
         let json = serde_json::to_string(&thread).unwrap();
         let restored: Thread = serde_json::from_str(&json).unwrap();
@@ -862,7 +866,6 @@ mod tests {
         assert_eq!(restored.turns.len(), 1);
         assert_eq!(restored.turns[0].user_input, "hello");
         assert_eq!(restored.turns[0].response, Some("world".to_string()));
-        assert_eq!(restored.last_response_id, Some("resp_abc123".to_string()));
     }
 
     #[test]

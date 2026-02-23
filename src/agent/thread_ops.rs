@@ -6,11 +6,14 @@
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::agent::Agent;
 use crate::agent::compaction::ContextCompactor;
-use crate::agent::dispatcher::{AgenticLoopResult, detect_auth_awaiting, parse_auth_result};
+use crate::agent::dispatcher::{
+    AgenticLoopResult, check_auth_required, execute_chat_tool_standalone, parse_auth_result,
+};
 use crate::agent::session::{PendingApproval, Session, ThreadState};
 use crate::agent::submission::SubmissionResult;
 use crate::channels::{IncomingMessage, StatusUpdate};
@@ -82,20 +85,6 @@ impl Agent {
         let mut thread = crate::agent::session::Thread::with_id(thread_uuid, session_id);
         if !chat_messages.is_empty() {
             thread.restore_from_messages(chat_messages);
-        }
-
-        // Restore response chain from conversation metadata
-        if let Some(store) = self.store()
-            && let Ok(Some(metadata)) = store.get_conversation_metadata(thread_uuid).await
-            && let Some(rid) = metadata
-                .get("last_response_id")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        {
-            thread.last_response_id = Some(rid.clone());
-            self.llm()
-                .seed_response_chain(&thread_uuid.to_string(), rid);
-            tracing::debug!("Restored response chain for thread {}", thread_uuid);
         }
 
         // Insert into session and register with session manager
@@ -225,7 +214,7 @@ impl Agent {
                     )
                     .await;
 
-                let compactor = ContextCompactor::new(self.llm().clone());
+                let compactor = ContextCompactor::new(self.llm().clone(), self.safety().clone());
                 if let Err(e) = compactor
                     .compact(thread, strategy, self.workspace().map(|w| w.as_ref()))
                     .await
@@ -263,6 +252,10 @@ impl Agent {
             thread.messages()
         };
 
+        // Persist user message to DB immediately so it survives crashes
+        self.persist_user_message(thread_id, &message.user_id, content)
+            .await;
+
         // Send thinking status
         let _ = self
             .channels
@@ -275,7 +268,7 @@ impl Agent {
 
         // Run the agentic tool execution loop
         let result = self
-            .run_agentic_loop(message, session.clone(), thread_id, turn_messages, false)
+            .run_agentic_loop(message, session.clone(), thread_id, turn_messages)
             .await;
 
         // Re-acquire lock and check if interrupted
@@ -322,7 +315,6 @@ impl Agent {
                 };
 
                 thread.complete_turn(&response);
-                self.persist_response_chain(thread);
                 let _ = self
                     .channels
                     .send_status(
@@ -332,8 +324,9 @@ impl Agent {
                     )
                     .await;
 
-                // Fire-and-forget: persist turn to DB
-                self.persist_turn(thread_id, &message.user_id, content, Some(&response));
+                // Persist assistant response (user message already persisted at turn start)
+                self.persist_assistant_response(thread_id, &message.user_id, &response)
+                    .await;
 
                 Ok(SubmissionResult::response(response))
             }
@@ -361,92 +354,73 @@ impl Agent {
             }
             Err(e) => {
                 thread.fail_turn(e.to_string());
-
-                // Persist the user message even on failure
-                self.persist_turn(thread_id, &message.user_id, content, None);
-
+                // User message already persisted at turn start; nothing else to save
                 Ok(SubmissionResult::error(e.to_string()))
             }
         }
     }
 
-    /// Fire-and-forget: persist a turn (user message + optional assistant response) to the DB.
-    pub(super) fn persist_turn(
+    /// Persist the user message to the DB at turn start (before the agentic loop).
+    ///
+    /// This ensures the user message is durable even if the process crashes
+    /// mid-response. Call this right after `thread.start_turn()`.
+    pub(super) async fn persist_user_message(
         &self,
         thread_id: Uuid,
         user_id: &str,
         user_input: &str,
-        response: Option<&str>,
     ) {
         let store = match self.store() {
             Some(s) => Arc::clone(s),
             None => return,
         };
 
-        let user_id = user_id.to_string();
-        let user_input = user_input.to_string();
-        let response = response.map(String::from);
+        if let Err(e) = store
+            .ensure_conversation(thread_id, "gateway", user_id, None)
+            .await
+        {
+            tracing::warn!("Failed to ensure conversation {}: {}", thread_id, e);
+            return;
+        }
 
-        tokio::spawn(async move {
-            if let Err(e) = store
-                .ensure_conversation(thread_id, "gateway", &user_id, None)
-                .await
-            {
-                tracing::warn!("Failed to ensure conversation {}: {}", thread_id, e);
-                return;
-            }
-
-            if let Err(e) = store
-                .add_conversation_message(thread_id, "user", &user_input)
-                .await
-            {
-                tracing::warn!("Failed to persist user message: {}", e);
-                return;
-            }
-
-            if let Some(ref resp) = response
-                && let Err(e) = store
-                    .add_conversation_message(thread_id, "assistant", resp)
-                    .await
-            {
-                tracing::warn!("Failed to persist assistant message: {}", e);
-            }
-        });
+        if let Err(e) = store
+            .add_conversation_message(thread_id, "user", user_input)
+            .await
+        {
+            tracing::warn!("Failed to persist user message: {}", e);
+        }
     }
 
-    /// Sync the provider's response chain ID to the thread and DB metadata.
+    /// Persist the assistant response to the DB after the agentic loop completes.
     ///
-    /// Call after a successful agentic loop to persist the latest
-    /// `previous_response_id` so chaining survives restarts.
-    pub(super) fn persist_response_chain(&self, thread: &mut crate::agent::session::Thread) {
-        let tid = thread.id.to_string();
-        let response_id = match self.llm().get_response_chain_id(&tid) {
-            Some(rid) => rid,
-            None => return,
-        };
-
-        // Update in-memory thread
-        thread.last_response_id = Some(response_id.clone());
-
-        // Fire-and-forget DB write
+    /// Re-ensures the conversation row exists so that assistant responses are
+    /// still persisted even if `persist_user_message` failed transiently at
+    /// turn start (e.g. a brief DB blip that resolved before response time).
+    pub(super) async fn persist_assistant_response(
+        &self,
+        thread_id: Uuid,
+        user_id: &str,
+        response: &str,
+    ) {
         let store = match self.store() {
             Some(s) => Arc::clone(s),
             None => return,
         };
-        let thread_id = thread.id;
-        tokio::spawn(async move {
-            let val = serde_json::json!(response_id);
-            if let Err(e) = store
-                .update_conversation_metadata_field(thread_id, "last_response_id", &val)
-                .await
-            {
-                tracing::warn!(
-                    "Failed to persist response chain for thread {}: {}",
-                    thread_id,
-                    e
-                );
-            }
-        });
+
+        if let Err(e) = store
+            .ensure_conversation(thread_id, "gateway", user_id, None)
+            .await
+        {
+            tracing::warn!("Failed to ensure conversation {}: {}", thread_id, e);
+            return;
+        }
+
+        if let Err(e) = store
+            .add_conversation_message(thread_id, "assistant", response)
+            .await
+        {
+            tracing::warn!("Failed to persist assistant message: {}", e);
+        }
     }
 
     pub(super) async fn process_undo(
@@ -559,7 +533,7 @@ impl Agent {
                 crate::agent::context_monitor::CompactionStrategy::Summarize { keep_recent: 5 },
             );
 
-        let compactor = ContextCompactor::new(self.llm().clone());
+        let compactor = ContextCompactor::new(self.llm().clone(), self.safety().clone());
         match compactor
             .compact(thread, strategy, self.workspace().map(|w| w.as_ref()))
             .await
@@ -608,8 +582,8 @@ impl Agent {
         approved: bool,
         always: bool,
     ) -> Result<SubmissionResult, Error> {
-        // Get thread state and pending approval
-        let (_thread_state, pending) = {
+        // Get pending approval for this thread
+        let pending = {
             let mut sess = session.lock().await;
             let thread = sess
                 .threads
@@ -620,8 +594,7 @@ impl Agent {
                 return Ok(SubmissionResult::error("No pending approval request."));
             }
 
-            let pending = thread.take_pending_approval();
-            (thread.state, pending)
+            thread.take_pending_approval()
         };
 
         let pending = match pending {
@@ -734,29 +707,17 @@ impl Agent {
             // If tool_auth returned awaiting_token, enter auth mode and
             // return instructions directly (skip agentic loop continuation).
             if let Some((ext_name, instructions)) =
-                detect_auth_awaiting(&pending.tool_name, &tool_result)
+                check_auth_required(&pending.tool_name, &tool_result)
             {
-                let auth_data = parse_auth_result(&tool_result);
-                {
-                    let mut sess = session.lock().await;
-                    if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                        thread.enter_auth_mode(ext_name.clone());
-                        thread.complete_turn(&instructions);
-                    }
-                }
-                let _ = self
-                    .channels
-                    .send_status(
-                        &message.channel,
-                        StatusUpdate::AuthRequired {
-                            extension_name: ext_name,
-                            instructions: Some(instructions.clone()),
-                            auth_url: auth_data.auth_url,
-                            setup_url: auth_data.setup_url,
-                        },
-                        &message.metadata,
-                    )
-                    .await;
+                self.handle_auth_intercept(
+                    &session,
+                    thread_id,
+                    message,
+                    &tool_result,
+                    ext_name,
+                    instructions.clone(),
+                )
+                .await;
                 return Ok(SubmissionResult::response(instructions));
             }
 
@@ -798,89 +759,165 @@ impl Agent {
                     .await;
             }
 
-            let mut deferred_queue = std::collections::VecDeque::from(deferred_tool_calls);
-            while let Some(tc) = deferred_queue.pop_front() {
-                // Re-check approval for each deferred tool call
-                if let Some(tool) = self.tools().get(&tc.name).await
-                    && tool.requires_approval()
-                {
-                    let is_auto_approved = {
-                        let sess = session.lock().await;
-                        let mut approved = sess.is_tool_auto_approved(&tc.name);
-                        if approved && tool.requires_approval_for(&tc.arguments) {
-                            approved = false;
+            // === Phase 1: Preflight (sequential) ===
+            // Walk deferred tools checking approval. Collect runnable
+            // tools; stop at the first that needs approval.
+            let mut runnable: Vec<crate::llm::ToolCall> = Vec::new();
+            let mut approval_needed: Option<(
+                usize,
+                crate::llm::ToolCall,
+                Arc<dyn crate::tools::Tool>,
+            )> = None;
+
+            for (idx, tc) in deferred_tool_calls.iter().enumerate() {
+                if let Some(tool) = self.tools().get(&tc.name).await {
+                    use crate::tools::ApprovalRequirement;
+                    let needs_approval = match tool.requires_approval(&tc.arguments) {
+                        ApprovalRequirement::Never => false,
+                        ApprovalRequirement::UnlessAutoApproved => {
+                            let sess = session.lock().await;
+                            !sess.is_tool_auto_approved(&tc.name)
                         }
-                        approved
+                        ApprovalRequirement::Always => true,
                     };
 
-                    if !is_auto_approved {
-                        let new_pending = PendingApproval {
-                            request_id: Uuid::new_v4(),
-                            tool_name: tc.name.clone(),
-                            parameters: tc.arguments.clone(),
-                            description: tool.description().to_string(),
-                            tool_call_id: tc.id.clone(),
-                            context_messages: context_messages.clone(),
-                            deferred_tool_calls: deferred_queue.iter().cloned().collect(),
-                        };
-
-                        let request_id = new_pending.request_id;
-                        let tool_name = new_pending.tool_name.clone();
-                        let description = new_pending.description.clone();
-                        let parameters = new_pending.parameters.clone();
-
-                        {
-                            let mut sess = session.lock().await;
-                            if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                                thread.await_approval(new_pending);
-                            }
-                        }
-
-                        let _ = self
-                            .channels
-                            .send_status(
-                                &message.channel,
-                                StatusUpdate::Status("Awaiting approval".into()),
-                                &message.metadata,
-                            )
-                            .await;
-
-                        return Ok(SubmissionResult::NeedApproval {
-                            request_id,
-                            tool_name,
-                            description,
-                            parameters,
-                        });
+                    if needs_approval {
+                        approval_needed = Some((idx, tc.clone(), tool));
+                        break; // remaining tools stay deferred
                     }
                 }
 
-                let _ = self
-                    .channels
-                    .send_status(
-                        &message.channel,
-                        StatusUpdate::ToolStarted {
-                            name: tc.name.clone(),
-                        },
-                        &message.metadata,
-                    )
-                    .await;
+                runnable.push(tc.clone());
+            }
 
-                let deferred_result = self
-                    .execute_chat_tool(&tc.name, &tc.arguments, &job_ctx)
-                    .await;
+            // === Phase 2: Parallel execution ===
+            let exec_results: Vec<(crate::llm::ToolCall, Result<String, Error>)> = if runnable.len()
+                <= 1
+            {
+                // Single tool (or none): execute inline
+                let mut results = Vec::new();
+                for tc in &runnable {
+                    let _ = self
+                        .channels
+                        .send_status(
+                            &message.channel,
+                            StatusUpdate::ToolStarted {
+                                name: tc.name.clone(),
+                            },
+                            &message.metadata,
+                        )
+                        .await;
 
-                let _ = self
-                    .channels
-                    .send_status(
-                        &message.channel,
-                        StatusUpdate::ToolCompleted {
-                            name: tc.name.clone(),
-                            success: deferred_result.is_ok(),
-                        },
-                        &message.metadata,
-                    )
-                    .await;
+                    let result = self
+                        .execute_chat_tool(&tc.name, &tc.arguments, &job_ctx)
+                        .await;
 
+                    let _ = self
+                        .channels
+                        .send_status(
+                            &message.channel,
+                            StatusUpdate::ToolCompleted {
+                                name: tc.name.clone(),
+                                success: result.is_ok(),
+                            },
+                            &message.metadata,
+                        )
+                        .await;
+
+                    results.push((tc.clone(), result));
+                }
+                results
+            } else {
+                // Multiple tools: execute in parallel via JoinSet
+                let mut join_set = JoinSet::new();
+                let runnable_count = runnable.len();
+
+                for (spawn_idx, tc) in runnable.iter().enumerate() {
+                    let tools = self.tools().clone();
+                    let safety = self.safety().clone();
+                    let channels = self.channels.clone();
+                    let job_ctx = job_ctx.clone();
+                    let tc = tc.clone();
+                    let channel = message.channel.clone();
+                    let metadata = message.metadata.clone();
+
+                    join_set.spawn(async move {
+                        let _ = channels
+                            .send_status(
+                                &channel,
+                                StatusUpdate::ToolStarted {
+                                    name: tc.name.clone(),
+                                },
+                                &metadata,
+                            )
+                            .await;
+
+                        let result = execute_chat_tool_standalone(
+                            &tools,
+                            &safety,
+                            &tc.name,
+                            &tc.arguments,
+                            &job_ctx,
+                        )
+                        .await;
+
+                        let _ = channels
+                            .send_status(
+                                &channel,
+                                StatusUpdate::ToolCompleted {
+                                    name: tc.name.clone(),
+                                    success: result.is_ok(),
+                                },
+                                &metadata,
+                            )
+                            .await;
+
+                        (spawn_idx, tc, result)
+                    });
+                }
+
+                // Collect and reorder by original index
+                let mut ordered: Vec<Option<(crate::llm::ToolCall, Result<String, Error>)>> =
+                    (0..runnable_count).map(|_| None).collect();
+                while let Some(join_result) = join_set.join_next().await {
+                    match join_result {
+                        Ok((idx, tc, result)) => {
+                            ordered[idx] = Some((tc, result));
+                        }
+                        Err(e) => {
+                            if e.is_panic() {
+                                tracing::error!("Deferred tool execution task panicked: {}", e);
+                            } else {
+                                tracing::error!("Deferred tool execution task cancelled: {}", e);
+                            }
+                        }
+                    }
+                }
+
+                // Fill panicked slots with error results
+                ordered
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, opt)| {
+                        opt.unwrap_or_else(|| {
+                            let tc = runnable[i].clone();
+                            let err: Error = crate::error::ToolError::ExecutionFailed {
+                                name: tc.name.clone(),
+                                reason: "Task failed during execution".to_string(),
+                            }
+                            .into();
+                            (tc, Err(err))
+                        })
+                    })
+                    .collect()
+            };
+
+            // === Phase 3: Post-flight (sequential, in original order) ===
+            // Process all results before any conditional return so every
+            // tool result is recorded in the session audit trail.
+            let mut deferred_auth: Option<String> = None;
+
+            for (tc, deferred_result) in exec_results {
                 if let Ok(ref output) = deferred_result
                     && !output.is_empty()
                 {
@@ -910,32 +947,21 @@ impl Agent {
                     }
                 }
 
-                // Auth detection for deferred tools
-                if let Some((ext_name, instructions)) =
-                    detect_auth_awaiting(&tc.name, &deferred_result)
+                // Auth detection — defer return until all results are recorded
+                if deferred_auth.is_none()
+                    && let Some((ext_name, instructions)) =
+                        check_auth_required(&tc.name, &deferred_result)
                 {
-                    let auth_data = parse_auth_result(&deferred_result);
-                    {
-                        let mut sess = session.lock().await;
-                        if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                            thread.enter_auth_mode(ext_name.clone());
-                            thread.complete_turn(&instructions);
-                        }
-                    }
-                    let _ = self
-                        .channels
-                        .send_status(
-                            &message.channel,
-                            StatusUpdate::AuthRequired {
-                                extension_name: ext_name,
-                                instructions: Some(instructions.clone()),
-                                auth_url: auth_data.auth_url,
-                                setup_url: auth_data.setup_url,
-                            },
-                            &message.metadata,
-                        )
-                        .await;
-                    return Ok(SubmissionResult::response(instructions));
+                    self.handle_auth_intercept(
+                        &session,
+                        thread_id,
+                        message,
+                        &deferred_result,
+                        ext_name,
+                        instructions.clone(),
+                    )
+                    .await;
+                    deferred_auth = Some(instructions);
                 }
 
                 let deferred_content = match deferred_result {
@@ -953,9 +979,55 @@ impl Agent {
                 context_messages.push(ChatMessage::tool_result(&tc.id, &tc.name, deferred_content));
             }
 
+            // Return auth response after all results are recorded
+            if let Some(instructions) = deferred_auth {
+                return Ok(SubmissionResult::response(instructions));
+            }
+
+            // Handle approval if a tool needed it
+            if let Some((approval_idx, tc, tool)) = approval_needed {
+                let new_pending = PendingApproval {
+                    request_id: Uuid::new_v4(),
+                    tool_name: tc.name.clone(),
+                    parameters: tc.arguments.clone(),
+                    description: tool.description().to_string(),
+                    tool_call_id: tc.id.clone(),
+                    context_messages: context_messages.clone(),
+                    deferred_tool_calls: deferred_tool_calls[approval_idx + 1..].to_vec(),
+                };
+
+                let request_id = new_pending.request_id;
+                let tool_name = new_pending.tool_name.clone();
+                let description = new_pending.description.clone();
+                let parameters = new_pending.parameters.clone();
+
+                {
+                    let mut sess = session.lock().await;
+                    if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                        thread.await_approval(new_pending);
+                    }
+                }
+
+                let _ = self
+                    .channels
+                    .send_status(
+                        &message.channel,
+                        StatusUpdate::Status("Awaiting approval".into()),
+                        &message.metadata,
+                    )
+                    .await;
+
+                return Ok(SubmissionResult::NeedApproval {
+                    request_id,
+                    tool_name,
+                    description,
+                    parameters,
+                });
+            }
+
             // Continue the agentic loop (a tool was already executed this turn)
             let result = self
-                .run_agentic_loop(message, session.clone(), thread_id, context_messages, true)
+                .run_agentic_loop(message, session.clone(), thread_id, context_messages)
                 .await;
 
             // Handle the result
@@ -968,7 +1040,9 @@ impl Agent {
             match result {
                 Ok(AgenticLoopResult::Response(response)) => {
                     thread.complete_turn(&response);
-                    self.persist_response_chain(thread);
+                    // User message already persisted at turn start; save assistant response
+                    self.persist_assistant_response(thread_id, &message.user_id, &response)
+                        .await;
                     let _ = self
                         .channels
                         .send_status(
@@ -1004,15 +1078,25 @@ impl Agent {
                 }
                 Err(e) => {
                     thread.fail_turn(e.to_string());
+                    // User message already persisted at turn start
                     Ok(SubmissionResult::error(e.to_string()))
                 }
             }
         } else {
-            // Rejected - clear approval and return to idle
+            // Rejected - complete the turn with a rejection message and persist
+            let rejection = format!(
+                "Tool '{}' was rejected. The agent will not execute this tool.\n\n\
+                 You can continue the conversation or try a different approach.",
+                pending.tool_name
+            );
             {
                 let mut sess = session.lock().await;
                 if let Some(thread) = sess.threads.get_mut(&thread_id) {
                     thread.clear_pending_approval();
+                    thread.complete_turn(&rejection);
+                    // User message already persisted at turn start; save rejection response
+                    self.persist_assistant_response(thread_id, &message.user_id, &rejection)
+                        .await;
                 }
             }
 
@@ -1025,12 +1109,48 @@ impl Agent {
                 )
                 .await;
 
-            Ok(SubmissionResult::response(format!(
-                "Tool '{}' was rejected. The agent will not execute this tool.\n\n\
-                 You can continue the conversation or try a different approach.",
-                pending.tool_name
-            )))
+            Ok(SubmissionResult::response(rejection))
         }
+    }
+
+    /// Handle an auth-required result from a tool execution.
+    ///
+    /// Enters auth mode on the thread, completes + persists the turn,
+    /// and sends the AuthRequired status to the channel.
+    /// Returns the instructions string for the caller to wrap in a response.
+    async fn handle_auth_intercept(
+        &self,
+        session: &Arc<Mutex<Session>>,
+        thread_id: Uuid,
+        message: &IncomingMessage,
+        tool_result: &Result<String, Error>,
+        ext_name: String,
+        instructions: String,
+    ) {
+        let auth_data = parse_auth_result(tool_result);
+        {
+            let mut sess = session.lock().await;
+            if let Some(thread) = sess.threads.get_mut(&thread_id) {
+                thread.enter_auth_mode(ext_name.clone());
+                thread.complete_turn(&instructions);
+                // User message already persisted at turn start; save auth instructions
+                self.persist_assistant_response(thread_id, &message.user_id, &instructions)
+                    .await;
+            }
+        }
+        let _ = self
+            .channels
+            .send_status(
+                &message.channel,
+                StatusUpdate::AuthRequired {
+                    extension_name: ext_name,
+                    instructions: Some(instructions.clone()),
+                    auth_url: auth_data.auth_url,
+                    setup_url: auth_data.setup_url,
+                },
+                &message.metadata,
+            )
+            .await;
     }
 
     /// Handle an auth token submitted while the thread is in auth mode.

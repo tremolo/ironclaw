@@ -13,7 +13,7 @@ use crate::agent::submission::SubmissionResult;
 use crate::agent::{Agent, MessageIntent};
 use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::error::Error;
-use crate::llm::ChatMessage;
+use crate::llm::{ChatMessage, Reasoning};
 
 impl Agent {
     /// Handle job-related intents without turn tracking.
@@ -73,35 +73,22 @@ impl Agent {
         description: String,
         category: Option<String>,
     ) -> Result<String, Error> {
-        // Create job context
         let job_id = self
-            .context_manager
-            .create_job_for_user(user_id, &title, &description)
+            .scheduler
+            .dispatch_job(user_id, &title, &description, None)
             .await?;
 
-        // Update category if provided
-        if let Some(cat) = category {
-            self.context_manager
+        // Set the dedicated category field (not stored in metadata)
+        if let Some(cat) = category
+            && let Err(e) = self
+                .context_manager
                 .update_context(job_id, |ctx| {
                     ctx.category = Some(cat);
                 })
-                .await?;
-        }
-
-        // Persist new job to database (fire-and-forget)
-        if let Some(store) = self.store()
-            && let Ok(ctx) = self.context_manager.get_context(job_id).await
+                .await
         {
-            let store = store.clone();
-            tokio::spawn(async move {
-                if let Err(e) = store.save_job(&ctx).await {
-                    tracing::warn!("Failed to persist new job {}: {}", job_id, e);
-                }
-            });
+            tracing::warn!(job_id = %job_id, "Failed to set job category: {}", e);
         }
-
-        // Schedule for execution
-        self.scheduler.schedule(job_id).await?;
 
         Ok(format!(
             "Created job: {}\nID: {}\n\nThe job has been scheduled and is now running.",
@@ -235,6 +222,7 @@ impl Agent {
             crate::workspace::hygiene::HygieneConfig::default(),
             workspace.clone(),
             self.llm().clone(),
+            self.safety().clone(),
         );
 
         match runner.check_heartbeat().await {
@@ -295,10 +283,11 @@ impl Agent {
             .with_max_tokens(512)
             .with_temperature(0.3);
 
-        match self.llm().complete(request).await {
-            Ok(response) => Ok(SubmissionResult::response(format!(
+        let reasoning = Reasoning::new(self.llm().clone(), self.safety().clone());
+        match reasoning.complete(request).await {
+            Ok((text, _usage)) => Ok(SubmissionResult::response(format!(
                 "Thread Summary:\n\n{}",
-                response.content.trim()
+                text.trim()
             ))),
             Err(e) => Ok(SubmissionResult::error(format!("Summarize failed: {}", e))),
         }
@@ -342,10 +331,11 @@ impl Agent {
             .with_max_tokens(512)
             .with_temperature(0.5);
 
-        match self.llm().complete(request).await {
-            Ok(response) => Ok(SubmissionResult::response(format!(
+        let reasoning = Reasoning::new(self.llm().clone(), self.safety().clone());
+        match reasoning.complete(request).await {
+            Ok((text, _usage)) => Ok(SubmissionResult::response(format!(
                 "Suggested Next Steps:\n\n{}",
-                response.content.trim()
+                text.trim()
             ))),
             Err(e) => Ok(SubmissionResult::error(format!("Suggest failed: {}", e))),
         }
