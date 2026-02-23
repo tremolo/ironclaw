@@ -84,7 +84,7 @@ struct ChannelStoreData {
     http_runtime: Option<tokio::runtime::Runtime>,
     /// Matrix E2EE crypto middleware, if enabled and configured.
     #[cfg(feature = "matrix-e2ee")]
-    crypto_middleware: Option<MatrixCryptoMiddleware>,
+    crypto_state: crate::matrix::crypto::SharedCryptoState,
 }
 
 impl ChannelStoreData {
@@ -94,6 +94,7 @@ impl ChannelStoreData {
         capabilities: ChannelCapabilities,
         credentials: HashMap<String, String>,
         pairing_store: Arc<PairingStore>,
+        #[cfg(feature = "matrix-e2ee")] crypto_state: crate::matrix::crypto::SharedCryptoState,
     ) -> Self {
         // Create a minimal WASI context (no filesystem, no env vars for security)
         let wasi = WasiCtxBuilder::new().build();
@@ -107,26 +108,20 @@ impl ChannelStoreData {
             pairing_store,
             http_runtime: None,
             #[cfg(feature = "matrix-e2ee")]
-            crypto_middleware: None,
+            crypto_state,
         }
     }
 
     /// Set the Matrix crypto middleware for this channel.
     #[cfg(feature = "matrix-e2ee")]
-    pub fn set_crypto_middleware(&mut self, middleware: MatrixCryptoMiddleware) {
-        self.crypto_middleware = Some(middleware);
+    pub fn set_crypto_state(&mut self, crypto_state: crate::matrix::crypto::SharedCryptoState) {
+        self.crypto_state = crypto_state;
     }
 
-    /// Get a reference to the crypto middleware, if available.
+    /// Get a reference to the crypto state, if available.
     #[cfg(feature = "matrix-e2ee")]
-    pub fn crypto_middleware(&self) -> Option<&MatrixCryptoMiddleware> {
-        self.crypto_middleware.as_ref()
-    }
-
-    /// Get a mutable reference to the crypto middleware, if available.
-    #[cfg(feature = "matrix-e2ee")]
-    pub fn crypto_middleware_mut(&mut self) -> Option<&mut MatrixCryptoMiddleware> {
-        self.crypto_middleware.as_mut()
+    pub fn crypto_state(&self) -> &crate::matrix::crypto::SharedCryptoState {
+        &self.crypto_state
     }
 
     /// Inject credentials into a string by replacing placeholders.
@@ -437,7 +432,7 @@ impl near::agent::channel_host::Host for ChannelStoreData {
         // Scrub credential values from error messages before logging or returning
         // to WASM. reqwest::Error includes the full URL (with injected credentials)
         // in its Display output.
-        let result = result.map_err(|e| self.redact_credentials(&e));
+        let result = result.map_err(|e| self.redact_credentials(&e.to_string()));
 
         match &result {
             Ok(resp) => {
@@ -573,6 +568,10 @@ pub struct WasmChannel {
 
     /// Pairing store for DM pairing (guest access control).
     pairing_store: Arc<PairingStore>,
+
+    /// Matrix E2EE crypto middleware, shared across all WASM executions.
+    #[cfg(feature = "matrix-e2ee")]
+    crypto_state: crate::matrix::crypto::SharedCryptoState,
 }
 
 impl WasmChannel {
@@ -603,6 +602,8 @@ impl WasmChannel {
             credentials: Arc::new(RwLock::new(HashMap::new())),
             typing_task: RwLock::new(None),
             pairing_store,
+            #[cfg(feature = "matrix-e2ee")]
+            crypto_state: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -660,6 +661,73 @@ impl WasmChannel {
         self.endpoints.read().await.clone()
     }
 
+    /// Initialize the Matrix crypto middleware if encryption is enabled.
+    #[cfg(feature = "matrix-e2ee")]
+    async fn initialize_crypto_middleware(&self) -> Result<(), String> {
+        if !self.capabilities.encryption {
+            tracing::debug!(
+                channel = %self.name,
+                "Encryption not enabled, skipping crypto middleware initialization"
+            );
+            return Ok(());
+        }
+
+        tracing::info!(
+            channel = %self.name,
+            "Initializing Matrix crypto middleware"
+        );
+
+        // Get Matrix credentials from channel config
+        let config_guard = self.config_json.read().await;
+        let config: HashMap<String, serde_json::Value> =
+            serde_json::from_str(&config_guard).map_err(|e| e.to_string())?;
+
+        let user_id = config
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Matrix user_id not found in channel config".to_string())?;
+
+        let homeserver = config
+            .get("homeserver")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Matrix homeserver not found in channel config".to_string())?;
+
+        let access_token = config
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Matrix access_token not found in channel config".to_string())?;
+
+        drop(config_guard);
+
+        // Create crypto config
+        let data_dir = dirs::home_dir()
+            .map(|p| p.join(".ironclaw").to_string_lossy().to_string())
+            .unwrap_or_else(|| ".".to_string());
+
+        let crypto_config = MatrixCryptoConfig::new(
+            user_id.to_string(),
+            homeserver.to_string(),
+            access_token.to_string(),
+            &data_dir,
+        );
+
+        // Create and initialize the middleware
+        let mut middleware = MatrixCryptoMiddleware::new(crypto_config)?;
+        middleware.initialize().await?;
+
+        // Store in shared state
+        let mut crypto_state = self.crypto_state.write().await;
+        *crypto_state = Some(middleware);
+
+        tracing::info!(
+            channel = %self.name,
+            user_id = %user_id,
+            "Matrix crypto middleware initialized successfully"
+        );
+
+        Ok(())
+    }
+
     /// Add channel host functions to the linker using generated bindings.
     ///
     /// Uses the wasmtime::component::bindgen! generated `add_to_linker` function
@@ -685,6 +753,7 @@ impl WasmChannel {
         capabilities: &ChannelCapabilities,
         credentials: HashMap<String, String>,
         pairing_store: Arc<PairingStore>,
+        #[cfg(feature = "matrix-e2ee")] crypto_state: Option<crate::matrix::crypto::SharedCryptoState>,
     ) -> Result<Store<ChannelStoreData>, WasmChannelError> {
         let engine = runtime.engine();
         let limits = &prepared.limits;
@@ -696,6 +765,8 @@ impl WasmChannel {
             capabilities.clone(),
             credentials,
             pairing_store,
+            #[cfg(feature = "matrix-e2ee")]
+            crypto_state.unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(None))),
         );
         let mut store = Store::new(engine, store_data);
 
@@ -797,6 +868,8 @@ impl WasmChannel {
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
         let pairing_store = self.pairing_store.clone();
+        #[cfg(feature = "matrix-e2ee")]
+        let crypto_state = self.crypto_state.clone();
 
         // Execute in blocking task with timeout
         let result = tokio::time::timeout(timeout, async move {
@@ -807,6 +880,8 @@ impl WasmChannel {
                     &capabilities,
                     credentials,
                     pairing_store,
+                    #[cfg(feature = "matrix-e2ee")]
+                    Some(crypto_state),
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -927,6 +1002,8 @@ impl WasmChannel {
         let timeout = self.runtime.config().callback_timeout;
         let credentials = self.get_credentials().await;
         let pairing_store = self.pairing_store.clone();
+        #[cfg(feature = "matrix-e2ee")]
+        let crypto_state = self.crypto_state.clone();
 
         // Prepare request data
         let method = method.to_string();
@@ -946,6 +1023,8 @@ impl WasmChannel {
                     &capabilities,
                     credentials,
                     pairing_store,
+                    #[cfg(feature = "matrix-e2ee")]
+                    Some(crypto_state),
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -1020,6 +1099,8 @@ impl WasmChannel {
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
         let pairing_store = self.pairing_store.clone();
+        #[cfg(feature = "matrix-e2ee")]
+        let crypto_state = self.crypto_state.clone();
 
         // Execute in blocking task with timeout
         let result = tokio::time::timeout(timeout, async move {
@@ -1030,6 +1111,8 @@ impl WasmChannel {
                     &capabilities,
                     credentials,
                     pairing_store,
+                    #[cfg(feature = "matrix-e2ee")]
+                    Some(crypto_state),
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -1115,6 +1198,8 @@ impl WasmChannel {
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
         let pairing_store = self.pairing_store.clone();
+        #[cfg(feature = "matrix-e2ee")]
+        let crypto_state = self.crypto_state.clone();
 
         // Prepare response data
         let message_id_str = message_id.to_string();
@@ -1134,6 +1219,8 @@ impl WasmChannel {
                     &capabilities,
                     credentials,
                     pairing_store,
+                    #[cfg(feature = "matrix-e2ee")]
+                    Some(crypto_state),
                 )?;
 
                 tracing::info!("Instantiating WASM component for on_respond");
@@ -1228,6 +1315,8 @@ impl WasmChannel {
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
         let pairing_store = self.pairing_store.clone();
+        #[cfg(feature = "matrix-e2ee")]
+        let crypto_state = self.crypto_state.clone();
 
         let wit_update = status_to_wit(status, metadata);
 
@@ -1239,6 +1328,8 @@ impl WasmChannel {
                     &capabilities,
                     credentials,
                     pairing_store,
+                    #[cfg(feature = "matrix-e2ee")]
+                    Some(crypto_state),
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -1287,6 +1378,7 @@ impl WasmChannel {
         pairing_store: Arc<PairingStore>,
         timeout: Duration,
         wit_update: wit_channel::StatusUpdate,
+        #[cfg(feature = "matrix-e2ee")] crypto_state: Option<crate::matrix::crypto::SharedCryptoState>,
     ) -> Result<(), WasmChannelError> {
         if prepared.component_bytes.is_empty() {
             return Ok(());
@@ -1306,6 +1398,8 @@ impl WasmChannel {
                     &capabilities,
                     credentials_snapshot,
                     pairing_store,
+                    #[cfg(feature = "matrix-e2ee")]
+                    crypto_state,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -1377,6 +1471,8 @@ impl WasmChannel {
                 let pairing_store = self.pairing_store.clone();
                 let callback_timeout = self.runtime.config().callback_timeout;
                 let wit_update = status_to_wit(&status, metadata);
+                #[cfg(feature = "matrix-e2ee")]
+                let crypto_state = Some(self.crypto_state.clone());
 
                 let handle = tokio::spawn(async move {
                     let mut interval = tokio::time::interval(Duration::from_secs(4));
@@ -1397,6 +1493,8 @@ impl WasmChannel {
                             pairing_store.clone(),
                             callback_timeout,
                             wit_update_clone,
+                            #[cfg(feature = "matrix-e2ee")]
+                            crypto_state.clone(),
                         )
                         .await
                         {
@@ -1527,6 +1625,8 @@ impl WasmChannel {
         let credentials = self.credentials.clone();
         let pairing_store = self.pairing_store.clone();
         let callback_timeout = self.runtime.config().callback_timeout;
+        #[cfg(feature = "matrix-e2ee")]
+        let crypto_state = Some(self.crypto_state.clone());
 
         tokio::spawn(async move {
             let mut interval_timer = tokio::time::interval(interval);
@@ -1549,6 +1649,8 @@ impl WasmChannel {
                             &credentials,
                             pairing_store.clone(),
                             callback_timeout,
+                            #[cfg(feature = "matrix-e2ee")]
+                            crypto_state.clone(),
                         ).await;
 
                         match result {
@@ -1600,6 +1702,7 @@ impl WasmChannel {
         credentials: &RwLock<HashMap<String, String>>,
         pairing_store: Arc<PairingStore>,
         timeout: Duration,
+        #[cfg(feature = "matrix-e2ee")] crypto_state: Option<crate::matrix::crypto::SharedCryptoState>,
     ) -> Result<Vec<EmittedMessage>, WasmChannelError> {
         // Skip if no WASM bytes (testing mode)
         if prepared.component_bytes.is_empty() {
@@ -1625,6 +1728,8 @@ impl WasmChannel {
                     &capabilities,
                     credentials_snapshot,
                     pairing_store,
+                    #[cfg(feature = "matrix-e2ee")]
+                    crypto_state,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -1772,6 +1877,17 @@ impl Channel for WasmChannel {
 
         // Store the config
         *self.channel_config.write().await = Some(config.clone());
+
+        // Initialize Matrix crypto middleware if encryption is enabled
+        #[cfg(feature = "matrix-e2ee")]
+        {
+            self.initialize_crypto_middleware().await.map_err(|e| {
+                ChannelError::StartupFailed {
+                    name: self.name.clone(),
+                    reason: format!("Failed to initialize crypto middleware: {}", e),
+                }
+            })?;
+        }
 
         // Register HTTP endpoints
         let mut endpoints = Vec::new();
@@ -2255,6 +2371,8 @@ mod tests {
         let capabilities = ChannelCapabilities::for_channel("poll-test").with_polling(1000);
         let credentials = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
         let timeout = std::time::Duration::from_secs(5);
+        #[cfg(feature = "matrix-e2ee")]
+        let crypto_state = Some(Arc::new(tokio::sync::RwLock::new(None)));
 
         let result = WasmChannel::execute_poll(
             "poll-test",
@@ -2264,6 +2382,8 @@ mod tests {
             &credentials,
             Arc::new(PairingStore::new()),
             timeout,
+            #[cfg(feature = "matrix-e2ee")]
+            crypto_state,
         )
         .await;
 
@@ -2618,6 +2738,8 @@ mod tests {
             ChannelCapabilities::default(),
             creds,
             Arc::new(PairingStore::new()),
+            #[cfg(feature = "matrix-e2ee")]
+            Arc::new(tokio::sync::RwLock::new(None)),
         );
 
         let error = "HTTP request failed: error sending request for url \
@@ -2649,6 +2771,8 @@ mod tests {
             ChannelCapabilities::default(),
             std::collections::HashMap::new(),
             Arc::new(PairingStore::new()),
+            #[cfg(feature = "matrix-e2ee")]
+            Arc::new(tokio::sync::RwLock::new(None)),
         );
 
         let input = "some error message";
@@ -2668,6 +2792,8 @@ mod tests {
             ChannelCapabilities::default(),
             creds,
             Arc::new(PairingStore::new()),
+            #[cfg(feature = "matrix-e2ee")]
+            Arc::new(tokio::sync::RwLock::new(None)),
         );
 
         let input = "should not match anything";

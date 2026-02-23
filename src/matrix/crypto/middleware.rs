@@ -158,10 +158,18 @@ impl MatrixCryptoMiddleware {
         url: &str,
         body: Option<Vec<u8>>,
     ) -> CryptoProcessResult<(String, String, Option<Vec<u8>>)> {
+        tracing::debug!(
+            method = %method,
+            url = %url,
+            body_len = body.as_ref().map(|b| b.len()).unwrap_or(0),
+            "Intercepting outbound Matrix message"
+        );
+
         // Extract room ID from URL
         let room_id = match extract_room_id_from_url(url) {
             Some(id) => id,
             None => {
+                tracing::debug!("Could not extract room ID from URL, passing through");
                 return CryptoProcessResult::PassThrough((
                     method.to_string(),
                     url.to_string(),
@@ -180,10 +188,13 @@ impl MatrixCryptoMiddleware {
             ));
         }
 
+        tracing::info!(room_id = %room_id, "Encrypting outbound message for encrypted room");
+
         // Parse the body as JSON
         let body = match body {
             Some(b) => b,
             None => {
+                tracing::debug!("No message body, passing through");
                 return CryptoProcessResult::PassThrough((
                     method.to_string(),
                     url.to_string(),
@@ -208,7 +219,7 @@ impl MatrixCryptoMiddleware {
         let room_id_parsed = match ruma::RoomId::parse(&room_id) {
             Ok(id) => id,
             Err(e) => {
-                tracing::warn!(error = %e, "Invalid room ID");
+                tracing::warn!(error = %e, room_id = %room_id, "Invalid room ID");
                 return CryptoProcessResult::PassThrough((
                     method.to_string(),
                     url.to_string(),
@@ -270,7 +281,7 @@ impl MatrixCryptoMiddleware {
             }
         };
 
-        tracing::debug!(room_id = %room_id, "Encrypted message successfully");
+        tracing::info!(room_id = %room_id, "Encrypted message successfully");
         CryptoProcessResult::Processed((
             method.to_string(),
             new_url,
@@ -278,7 +289,7 @@ impl MatrixCryptoMiddleware {
         ))
     }
 
-    /// Encrypt an outbound room message (no-op).
+    /// Encrypt an outbound room message (no-op when feature disabled).
     #[cfg(not(feature = "matrix-e2ee"))]
     fn encrypt_outbound_message(
         &self,
@@ -286,19 +297,15 @@ impl MatrixCryptoMiddleware {
         url: &str,
         body: Option<Vec<u8>>,
     ) -> CryptoProcessResult<(String, String, Option<Vec<u8>>)> {
-
-        // Check if room is encrypted
-        if !self.is_room_encrypted(&room_id) {
-            tracing::debug!(room_id = %room_id, "Room not encrypted, passing through plaintext");
-            return CryptoProcessResult::PassThrough((
-                method.to_string(),
-                url.to_string(),
-                body,
-            ));
-        }
+        tracing::debug!("Matrix E2EE not enabled, passing through plaintext");
+        CryptoProcessResult::PassThrough((
+            method.to_string(),
+            url.to_string(),
+            body,
+        ))
     }
 
-        // Get the OlmMachine
+    /// Get the OlmMachine
     #[cfg(feature = "matrix-e2ee")]
     pub async fn intercept_response(
         &mut self,
@@ -735,4 +742,105 @@ mod tests {
         assert!(cache.is_encrypted("!room:example.org"));
         assert!(!cache.is_encrypted("!unknown:example.org"));
     }
+
+    #[test]
+    fn test_crypto_process_result_map() {
+        let result: CryptoProcessResult<String> = CryptoProcessResult::PassThrough("test".to_string());
+        let mapped = result.map(|s| s.len());
+        assert!(matches!(mapped, CryptoProcessResult::PassThrough(4)));
+
+        let result2: CryptoProcessResult<String> = CryptoProcessResult::Processed("hello".to_string());
+        let mapped2 = result2.map(|s| s.to_uppercase());
+        assert!(matches!(mapped2, CryptoProcessResult::Processed(ref s) if s == "HELLO"));
+
+        let result3: CryptoProcessResult<String> = CryptoProcessResult::Error("failed".to_string());
+        let mapped3 = result3.map(|s| s.len());
+        assert!(matches!(mapped3, CryptoProcessResult::Error(ref e) if e == "failed"));
+    }
+
+    #[test]
+    fn test_crypto_process_result_is_error() {
+        let pass: CryptoProcessResult<()> = CryptoProcessResult::PassThrough(());
+        assert!(!pass.is_error());
+
+        let processed: CryptoProcessResult<()> = CryptoProcessResult::Processed(());
+        assert!(!processed.is_error());
+
+        let error: CryptoProcessResult<()> = CryptoProcessResult::Error("err".to_string());
+        assert!(error.is_error());
+    }
+
+    #[test]
+    fn test_matrix_api_detection() {
+        // Matrix API URLs
+        assert!(is_matrix_api_url("/_matrix/client/r0/sync"));
+        assert!(is_matrix_api_url("/_matrix/client/v3/rooms/!room:example.org/send/m.room.message"));
+        assert!(is_matrix_api_url("/_matrix/client/r0/rooms/!room:example.org/state/m.room.encryption"));
+        
+        // Non-Matrix URLs
+        assert!(!is_matrix_api_url("/api/users"));
+        assert!(!is_matrix_api_url("https://example.com/webhook"));
+        assert!(!is_matrix_api_url("/_synapse/admin/v1/users"));
+    }
+
+    #[test]
+    fn test_message_send_path_detection() {
+        // Message send URLs
+        assert!(is_message_send_path("/_matrix/client/r0/rooms/!room:example.org/send/m.room.message/txn1"));
+        assert!(is_message_send_path("/_matrix/client/v3/rooms/!room:example.org/send/m.room.message"));
+        
+        // Non-message URLs
+        assert!(!is_message_send_path("/_matrix/client/r0/sync"));
+        assert!(!is_message_send_path("/_matrix/client/r0/rooms/!room:example.org/state"));
+        assert!(!is_message_send_path("/_matrix/client/r0/rooms/!room:example.org/send/m.room.reaction"));
+    }
+
+    #[test]
+    fn test_encrypted_event_path() {
+        let url = "/_matrix/client/r0/rooms/!room:example.org/send/m.room.message/txn1";
+        let encrypted = build_encrypted_event_path(url);
+        assert!(encrypted.contains("/send/m.room.encrypted/"));
+        assert!(encrypted.contains("!room:example.org"));
+        
+        // Should preserve the txn ID
+        assert!(encrypted.contains("txn1"));
+    }
+
+    #[cfg(feature = "matrix-e2ee")]
+    #[tokio::test]
+    async fn test_middleware_creation() {
+        use crate::matrix::crypto::types::MatrixIdentity;
+        
+        let config = MatrixCryptoConfig {
+            identity: MatrixIdentity {
+                user_id: "@test:example.org".to_string(),
+                homeserver: "https://example.org".to_string(),
+                access_token: "test_token".to_string(),
+            },
+            crypto_store_path: "/tmp/test_crypto".to_string(),
+            verify_devices: false,
+            key_claim_timeout_ms: 5000,
+            max_session_cache: 10,
+        };
+
+        let middleware = MatrixCryptoMiddleware::new(config);
+        assert!(middleware.is_ok());
+        let mw = middleware.unwrap();
+        assert!(!mw.is_enabled()); // Not initialized yet
+    }
+}
+
+/// Check if URL is a Matrix Client-Server API URL.
+fn is_matrix_api_url(url: &str) -> bool {
+    url.contains("/_matrix/client/")
+}
+
+/// Check if URL is for sending a room message.
+fn is_message_send_path(url: &str) -> bool {
+    url.contains("/rooms/") && url.contains("/send/m.room.message")
+}
+
+/// Build encrypted event path from message path.
+fn build_encrypted_event_path(url: &str) -> String {
+    url.replace("/send/m.room.message", "/send/m.room.encrypted")
 }

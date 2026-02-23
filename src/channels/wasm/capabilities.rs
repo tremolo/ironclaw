@@ -49,6 +49,11 @@ pub struct ChannelCapabilities {
 
     /// Callback timeout duration.
     pub callback_timeout: Duration,
+
+    /// Enable Matrix E2EE for this channel.
+    /// When true, the channel will encrypt/decrypt Matrix room messages.
+    #[cfg(feature = "matrix-e2ee")]
+    pub encryption: bool,
 }
 
 impl Default for ChannelCapabilities {
@@ -62,6 +67,8 @@ impl Default for ChannelCapabilities {
             emit_rate_limit: EmitRateLimitConfig::default(),
             max_message_size: 64 * 1024, // 64 KB
             callback_timeout: Duration::from_secs(30),
+            #[cfg(feature = "matrix-e2ee")]
+            encryption: false,
         }
     }
 }
@@ -71,6 +78,8 @@ impl ChannelCapabilities {
     pub fn for_channel(name: &str) -> Self {
         Self {
             workspace_prefix: format!("channels/{}/", name),
+            #[cfg(feature = "matrix-e2ee")]
+            encryption: false,
             ..Default::default()
         }
     }
@@ -103,6 +112,13 @@ impl ChannelCapabilities {
     /// Set the base tool capabilities.
     pub fn with_tool_capabilities(mut self, capabilities: ToolCapabilities) -> Self {
         self.tool_capabilities = capabilities;
+        self
+    }
+
+    /// Enable or disable Matrix E2EE for this channel.
+    #[cfg(feature = "matrix-e2ee")]
+    pub fn with_encryption(mut self, enabled: bool) -> Self {
+        self.encryption = enabled;
         self
     }
 

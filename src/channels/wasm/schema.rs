@@ -169,6 +169,11 @@ impl ChannelCapabilitiesSchema {
             if let Some(timeout_secs) = channel.callback_timeout_secs {
                 caps.callback_timeout = Duration::from_secs(timeout_secs);
             }
+
+            #[cfg(feature = "matrix-e2ee")]
+            {
+                caps.encryption = channel.encryption;
+            }
         }
 
         caps
@@ -209,6 +214,11 @@ pub struct ChannelSpecificCapabilitiesSchema {
     /// Webhook configuration (secret header, etc.).
     #[serde(default)]
     pub webhook: Option<WebhookSchema>,
+
+    /// Enable Matrix E2EE for this channel.
+    #[cfg(feature = "matrix-e2ee")]
+    #[serde(default)]
+    pub encryption: bool,
 }
 
 /// Webhook configuration schema.
