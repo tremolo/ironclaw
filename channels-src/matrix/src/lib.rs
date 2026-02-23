@@ -406,7 +406,7 @@ impl Guest for MatrixChannel {
             url_encode(&txn_id),
         );
 
-        let headers = serde_json::json!({"Content-Type": "application/json"});
+        let headers = serde_json::json!({"Content-Type": "application/json", "Authorization":  "Bearer {MATRIX_ACCESS_TOKEN}"});
 
         let result = channel_host::http_request(
             "PUT",
