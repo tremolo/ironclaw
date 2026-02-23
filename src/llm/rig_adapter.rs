@@ -486,6 +486,16 @@ where
         let tools = convert_tools(&request.tools, self.strict_schema);
         let tool_choice = convert_tool_choice(request.tool_choice.as_deref());
 
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            for tool in &tools {
+                tracing::debug!(
+                    tool_name = %tool.name,
+                    parameters = %serde_json::to_string_pretty(&tool.parameters).unwrap_or_default(),
+                    "Tool schema sent to LLM"
+                );
+            }
+        }
+
         let rig_req = build_rig_request(
             preamble,
             history,
