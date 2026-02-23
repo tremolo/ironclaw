@@ -231,7 +231,8 @@ impl Tool for HttpTool {
                     }
                 },
                 "body": {
-                    "description": "Request body (for POST/PUT/PATCH). Can be a JSON object, array, string, or other value."
+                    "type": "string",
+                    "description": "Request body (for POST/PUT/PATCH). Pass a JSON-encoded string for JSON payloads, or a plain string otherwise."
                 },
                 "timeout_secs": {
                     "type": "integer",
