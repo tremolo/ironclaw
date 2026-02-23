@@ -299,6 +299,17 @@ impl Guest for MatrixChannel {
             }
         };
 
+        // Log sync response structure
+        channel_host::log(
+            channel_host::LogLevel::Info,
+            &format!(
+                "Sync parsed: next_batch={} rooms_join_count={} rooms_invite_count={}",
+                sync.next_batch,
+                sync.rooms.as_ref().map(|r| r.join.len()).unwrap_or(0),
+                sync.rooms.as_ref().map(|r| r.invite.len()).unwrap_or(0)
+            ),
+        );
+
         // Persist next_batch token
         let _ = channel_host::workspace_write(SYNC_TOKEN_PATH, &sync.next_batch);
 
@@ -318,6 +329,20 @@ impl Guest for MatrixChannel {
             .unwrap_or_default();
         let display_name = channel_host::workspace_read(DISPLAY_NAME_PATH).unwrap_or_default();
 
+        channel_host::log(
+            channel_host::LogLevel::Debug,
+            &format!(
+                "Config loaded: dm_policy={} group_policy={} respond_to_all={} allow_from_count={} groups_count={} user_id={} display_name={}",
+                dm_policy,
+                group_policy,
+                respond_to_all,
+                allow_from.len(),
+                groups.len(),
+                user_id,
+                display_name
+            ),
+        );
+
         // Load DM rooms cache
         let mut dm_rooms: Vec<String> = channel_host::workspace_read(DM_ROOMS_PATH)
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -331,16 +356,31 @@ impl Guest for MatrixChannel {
         if let Some(rooms) = &sync.rooms {
             channel_host::log(
                 channel_host::LogLevel::Info,
-                &format!("Sync has rooms data: {} joined rooms", rooms.join.len()),
+                &format!(
+                    "Sync has rooms data: {} joined rooms, {} invite rooms",
+                    rooms.join.len(),
+                    rooms.invite.len()
+                ),
             );
 
             // Process joined rooms
             for (room_id, room) in &rooms.join {
+                let timeline_count = room.timeline.as_ref().map(|t| t.events.len()).unwrap_or(0);
+                let account_data_count = room
+                    .account_data
+                    .as_ref()
+                    .map(|a| a.events.len())
+                    .unwrap_or(0);
+                let member_count = room.summary.as_ref().and_then(|s| s.joined_member_count);
+
                 channel_host::log(
-                    channel_host::LogLevel::Debug,
+                    channel_host::LogLevel::Info,
                     &format!(
-                        "Processing room {} - is_direct={}",
+                        "Processing room {} - timeline_events={} account_data_events={} member_count={} is_direct={}",
                         room_id,
+                        timeline_count,
+                        account_data_count,
+                        member_count.unwrap_or(0),
                         is_dm_room(room_id, room, &dm_rooms)
                     ),
                 );
@@ -356,6 +396,31 @@ impl Guest for MatrixChannel {
                 }
 
                 if let Some(timeline) = &room.timeline {
+                    channel_host::log(
+                        channel_host::LogLevel::Info,
+                        &format!(
+                            "Room {} timeline: {} events - first event type={}",
+                            room_id,
+                            timeline.events.len(),
+                            timeline
+                                .events
+                                .first()
+                                .map(|e| &e.event_type)
+                                .unwrap_or("none")
+                        ),
+                    );
+                    for (i, event) in timeline.events.iter().enumerate() {
+                        channel_host::log(
+                            channel_host::LogLevel::Debug,
+                            &format!(
+                                "Event {}: type={} sender={} body={:?}",
+                                i,
+                                event.event_type,
+                                event.sender,
+                                event.content.get("body")
+                            ),
+                        );
+                    }
                     channel_host::log(
                         channel_host::LogLevel::Debug,
                         &format!(
@@ -737,6 +802,18 @@ fn process_timeline_event(
     };
 
     let metadata_json = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
+
+    channel_host::log(
+        channel_host::LogLevel::Info,
+        &format!(
+            "EMITTING message: room={} from={} content={} is_direct={} thread_id={}",
+            room_id,
+            event.sender,
+            content.chars().take(100).collect::<String>(),
+            is_direct,
+            thread_id
+        ),
+    );
 
     channel_host::emit_message(&EmittedMessage {
         user_id: event.sender.clone(),
