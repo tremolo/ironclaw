@@ -4,6 +4,7 @@
   "description": "Matrix Client-Server API channel for receiving and responding to Matrix messages",
   "capabilities": {
     "http": {
+      "allow_insecure_http": true,
       "allowlist": [
         {
           "host": "*",

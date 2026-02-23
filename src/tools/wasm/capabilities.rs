@@ -113,6 +113,8 @@ pub struct HttpCapability {
     pub max_response_bytes: usize,
     /// Request timeout.
     pub timeout: Duration,
+    /// Allow plain HTTP (insecure) requests. Default: false.
+    pub allow_insecure_http: bool,
 }
 
 impl Default for HttpCapability {
@@ -124,6 +126,7 @@ impl Default for HttpCapability {
             max_request_bytes: 1024 * 1024,       // 1 MB
             max_response_bytes: 10 * 1024 * 1024, // 10 MB
             timeout: Duration::from_secs(30),
+            allow_insecure_http: false,
         }
     }
 }
