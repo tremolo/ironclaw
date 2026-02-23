@@ -406,7 +406,7 @@ impl Guest for MatrixChannel {
                                 .events
                                 .first()
                                 .map(|e| &e.event_type)
-                                .unwrap_or("none")
+                                .map_or("none", |v| v)
                         ),
                     );
                     for (i, event) in timeline.events.iter().enumerate() {
