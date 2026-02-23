@@ -295,8 +295,8 @@ impl Guest for MatrixChannel {
         let _ = channel_host::workspace_write(SYNC_TOKEN_PATH, &sync.next_batch);
 
         // Read policy configs from workspace
-        let dm_policy = channel_host::workspace_read(DM_POLICY_PATH)
-            .unwrap_or_else(|| "pairing".to_string());
+        let dm_policy =
+            channel_host::workspace_read(DM_POLICY_PATH).unwrap_or_else(|| "pairing".to_string());
         let group_policy = channel_host::workspace_read(GROUP_POLICY_PATH)
             .unwrap_or_else(|| "allowlist".to_string());
         let respond_to_all = channel_host::workspace_read(RESPOND_TO_ALL_GROUP_PATH)
@@ -396,17 +396,20 @@ impl Guest for MatrixChannel {
             });
         }
 
-        let body_bytes = serde_json::to_vec(&body)
-            .map_err(|e| format!("Failed to serialize message: {}", e))?;
+        let body_bytes =
+            serde_json::to_vec(&body).map_err(|e| format!("Failed to serialize message: {}", e))?;
 
+        // Build message send URL with access token as query parameter
+        // This is more reliable than header injection for Matrix API
         let url = format!(
-            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}?access_token={{{}}}",
             homeserver,
             url_encode(&metadata.room_id),
             url_encode(&txn_id),
+            "MATRIX_ACCESS_TOKEN",
         );
 
-        let headers = serde_json::json!({"Content-Type": "application/json", "Authorization":  "Bearer {MATRIX_ACCESS_TOKEN}"});
+        let headers = serde_json::json!({"Content-Type": "application/json"});
 
         let result = channel_host::http_request(
             "PUT",
@@ -469,20 +472,16 @@ impl Guest for MatrixChannel {
         };
 
         let url = format!(
-            "{}/_matrix/client/v3/rooms/{}/typing/{}",
+            "{}/_matrix/client/v3/rooms/{}/typing/{}?access_token={{{}}}",
             homeserver,
             url_encode(&metadata.room_id),
             url_encode(&user_id),
+            "MATRIX_ACCESS_TOKEN",
         );
         let headers = serde_json::json!({"Content-Type": "application/json"});
 
-        let _ = channel_host::http_request(
-            "PUT",
-            &url,
-            &headers.to_string(),
-            Some(&body_bytes),
-            None,
-        );
+        let _ =
+            channel_host::http_request("PUT", &url, &headers.to_string(), Some(&body_bytes), None);
     }
 
     fn on_shutdown() {
@@ -568,11 +567,7 @@ fn process_timeline_event(
                                 ) {
                                     Ok(result) => {
                                         if result.created {
-                                            send_pairing_reply(
-                                                homeserver,
-                                                room_id,
-                                                &result.code,
-                                            );
+                                            send_pairing_reply(homeserver, room_id, &result.code);
                                         }
                                     }
                                     Err(e) => {
@@ -646,10 +641,7 @@ fn process_timeline_event(
 
     channel_host::log(
         channel_host::LogLevel::Debug,
-        &format!(
-            "Emitted message from {} in room {}",
-            event.sender, room_id
-        ),
+        &format!("Emitted message from {} in room {}", event.sender, room_id),
     );
 }
 
@@ -706,8 +698,8 @@ fn process_invites(invites: &HashMap<String, InvitedRoom>, homeserver: &str) {
         return;
     }
 
-    let auto_join = channel_host::workspace_read(AUTO_JOIN_PATH)
-        .unwrap_or_else(|| "off".to_string());
+    let auto_join =
+        channel_host::workspace_read(AUTO_JOIN_PATH).unwrap_or_else(|| "off".to_string());
 
     let auto_join_allowlist: Vec<String> = channel_host::workspace_read(AUTO_JOIN_ALLOWLIST_PATH)
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -722,18 +714,14 @@ fn process_invites(invites: &HashMap<String, InvitedRoom>, homeserver: &str) {
 
         if should_join {
             let url = format!(
-                "{}/_matrix/client/v3/join/{}",
+                "{}/_matrix/client/v3/join/{}?access_token={{{}}}",
                 homeserver,
                 url_encode(room_id),
+                "MATRIX_ACCESS_TOKEN",
             );
             let headers = serde_json::json!({"Content-Type": "application/json"});
-            match channel_host::http_request(
-                "POST",
-                &url,
-                &headers.to_string(),
-                Some(b"{}"),
-                None,
-            ) {
+            match channel_host::http_request("POST", &url, &headers.to_string(), Some(b"{}"), None)
+            {
                 Ok(r) if r.status == 200 => {
                     channel_host::log(
                         channel_host::LogLevel::Info,
@@ -777,10 +765,11 @@ fn send_pairing_reply(homeserver: &str, room_id: &str, code: &str) {
     };
 
     let url = format!(
-        "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+        "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}?access_token={{{}}}",
         homeserver,
         url_encode(room_id),
         url_encode(&txn_id),
+        "MATRIX_ACCESS_TOKEN",
     );
     let headers = serde_json::json!({"Content-Type": "application/json"});
 
@@ -792,7 +781,10 @@ fn send_pairing_reply(homeserver: &str, room_id: &str, code: &str) {
 // ============================================================================
 
 fn initialize_user(homeserver: &str) -> Option<String> {
-    let url = format!("{}/_matrix/client/v3/account/whoami", homeserver);
+    let url = format!(
+        "{}/_matrix/client/v3/account/whoami?access_token={{{}}}",
+        homeserver, "MATRIX_ACCESS_TOKEN"
+    );
     let response = match channel_host::http_request("GET", &url, "{}", None, None) {
         Ok(r) if r.status == 200 => r,
         Ok(r) => {
@@ -1171,7 +1163,10 @@ mod tests {
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: MatrixMessageMetadata = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.room_id, meta.room_id);
-        assert_eq!(parsed.thread_root_event_id, Some("$root:example.com".to_string()));
+        assert_eq!(
+            parsed.thread_root_event_id,
+            Some("$root:example.com".to_string())
+        );
         assert_eq!(parsed.reply_to_event_id, None);
     }
 
@@ -1215,17 +1210,29 @@ mod tests {
 
     #[test]
     fn test_check_mention_display_name() {
-        assert!(check_mention("hey @MyBot do this", "MyBot", "@mybot:server"));
+        assert!(check_mention(
+            "hey @MyBot do this",
+            "MyBot",
+            "@mybot:server"
+        ));
     }
 
     #[test]
     fn test_check_mention_user_id() {
-        assert!(check_mention("hey @mybot:server do this", "MyBot", "@mybot:server"));
+        assert!(check_mention(
+            "hey @mybot:server do this",
+            "MyBot",
+            "@mybot:server"
+        ));
     }
 
     #[test]
     fn test_check_mention_case_insensitive() {
-        assert!(check_mention("hey @MYBOT do this", "MyBot", "@mybot:server"));
+        assert!(check_mention(
+            "hey @MYBOT do this",
+            "MyBot",
+            "@mybot:server"
+        ));
     }
 
     #[test]
