@@ -547,8 +547,20 @@ fn process_timeline_event(
     groups: &HashMap<String, String>,
     homeserver: &str,
 ) {
+    channel_host::log(
+        channel_host::LogLevel::Debug,
+        &format!(
+            "Processing event: type={} room={} is_direct={} sender={}",
+            event.event_type, room_id, is_direct, event.sender
+        ),
+    );
+
     // Only process m.room.message events with msgtype m.text
     if event.event_type != "m.room.message" {
+        channel_host::log(
+            channel_host::LogLevel::Debug,
+            &format!("Skipping: wrong event type {}", event.event_type),
+        );
         return;
     }
 
@@ -558,23 +570,47 @@ fn process_timeline_event(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if msgtype != "m.text" {
+        channel_host::log(
+            channel_host::LogLevel::Debug,
+            &format!("Skipping: wrong msgtype {}", msgtype),
+        );
         return;
     }
 
     // Skip own messages
     if event.sender == user_id {
+        channel_host::log(channel_host::LogLevel::Debug, "Skipping: own message");
         return;
     }
 
     let body = match event.content.get("body").and_then(|v| v.as_str()) {
         Some(b) if !b.is_empty() => b,
-        _ => return,
+        _ => {
+            channel_host::log(
+                channel_host::LogLevel::Debug,
+                "Skipping: empty or missing body",
+            );
+            return;
+        }
     };
+
+    channel_host::log(
+        channel_host::LogLevel::Debug,
+        &format!("Message body: {}", body),
+    );
 
     // Extract thread/reply relations
     let (thread_root, reply_to, thread_id) = extract_relations(&event.content, room_id);
 
     if is_direct {
+        channel_host::log(
+            channel_host::LogLevel::Debug,
+            &format!(
+                "DM message - policy={} allow_from_count={}",
+                dm_policy,
+                allow_from.len()
+            ),
+        );
         // Apply DM policy
         match dm_policy {
             "disabled" => return,
@@ -586,11 +622,20 @@ fn process_timeline_event(
                     .iter()
                     .any(|a| a == "*" || a.to_lowercase() == sender_lower);
 
+                channel_host::log(
+                    channel_host::LogLevel::Debug,
+                    &format!("Sender {} in allowlist: {}", sender_lower, is_in_allow_from),
+                );
+
                 if !is_in_allow_from {
                     // Check pairing store
                     match channel_host::pairing_is_allowed(CHANNEL_NAME, &event.sender, None) {
                         Ok(true) => { /* pairing-allowed, emit */ }
                         _ => {
+                            channel_host::log(
+                                channel_host::LogLevel::Debug,
+                                "Pairing check failed - dropping message",
+                            );
                             if dm_policy == "pairing" {
                                 // Upsert pairing request
                                 let meta_json = serde_json::json!({
@@ -627,11 +672,23 @@ fn process_timeline_event(
         }
     } else {
         // Group message handling
+        channel_host::log(
+            channel_host::LogLevel::Debug,
+            &format!(
+                "Group message - policy={} groups_count={}",
+                group_policy,
+                groups.len()
+            ),
+        );
         match group_policy {
             "disabled" => return,
             "allowlist" => {
                 // Check room ID against groups config map
                 if !groups.contains_key(room_id) {
+                    channel_host::log(
+                        channel_host::LogLevel::Debug,
+                        &format!("Room {} not in groups allowlist - dropping", room_id),
+                    );
                     return;
                 }
             }
@@ -641,7 +698,18 @@ fn process_timeline_event(
 
         // Mention gating
         let has_mention = check_mention(body, display_name, user_id);
+        channel_host::log(
+            channel_host::LogLevel::Debug,
+            &format!(
+                "Mention check: has_mention={} respond_to_all={}",
+                has_mention, respond_to_all
+            ),
+        );
         if !respond_to_all && !has_mention {
+            channel_host::log(
+                channel_host::LogLevel::Debug,
+                "No mention and respond_to_all=false - dropping",
+            );
             return;
         }
     }
