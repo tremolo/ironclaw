@@ -409,8 +409,8 @@ impl near::agent::channel_host::Host for ChannelStoreData {
 
             // Log response body for debugging (truncated at char boundary)
             if let Ok(body_str) = std::str::from_utf8(&body) {
-                let truncated = if body_str.chars().count() > 500 {
-                    format!("{}...", body_str.chars().take(500).collect::<String>())
+                let truncated = if body_str.chars().count() > 5000 {
+                    format!("{}...", body_str.chars().take(5000).collect::<String>())
                 } else {
                     body_str.to_string()
                 };
@@ -424,10 +424,17 @@ impl near::agent::channel_host::Host for ChannelStoreData {
             let body = {
                 let needs_crypto = url.contains("/_matrix/client/") && url.contains("/sync");
                 
+                tracing::info!(
+                    needs_crypto = needs_crypto,
+                    url_preview = %url.chars().take(80).collect::<String>(),
+                    "E2EE sync interception check"
+                );
+
                 if needs_crypto {
                     let crypto_state_clone = self.crypto_state.clone();
                     let url_clone = url.clone();
                     let body_clone = body.clone();
+                    let body_len_before = body.len();
                     let status = status;
                     
                     // Spawn a separate thread to do crypto processing
@@ -438,13 +445,15 @@ impl near::agent::channel_host::Host for ChannelStoreData {
                         let rt = tokio::runtime::Runtime::new().unwrap();
                         let result = rt.block_on(async {
                             let crypto_guard = crypto_state_clone.read().await;
-                            if let Some(middleware) = crypto_guard.as_ref() {
+                            if let Some(_middleware) = crypto_guard.as_ref() {
                                 drop(crypto_guard);
                                 let mut crypto_guard = crypto_state_clone.write().await;
                                 if let Some(middleware) = crypto_guard.as_mut() {
+                                    tracing::info!("Crypto middleware active — intercepting sync response for decryption");
                                     return middleware.intercept_response(&url_clone, status, Some(body_clone)).await;
                                 }
                             }
+                            tracing::warn!("Crypto state is None — sync response will NOT be decrypted");
                             // Return pass-through if no middleware
                             crate::matrix::crypto::types::CryptoProcessResult::PassThrough((status, Some(body_clone)))
                         });
@@ -455,18 +464,25 @@ impl near::agent::channel_host::Host for ChannelStoreData {
                     if let Ok(result) = rx.recv() {
                         match result {
                             crate::matrix::crypto::types::CryptoProcessResult::Processed((_, new_body)) => {
-                                tracing::info!("Crypto middleware processed sync response");
-                                new_body.unwrap_or(body)
+                                let decrypted_body = new_body.unwrap_or(body);
+                                tracing::info!(
+                                    body_len_before = body_len_before,
+                                    body_len_after = decrypted_body.len(),
+                                    "Crypto middleware PROCESSED sync response (decryption applied)"
+                                );
+                                decrypted_body
                             }
                             crate::matrix::crypto::types::CryptoProcessResult::PassThrough((_, pass_body)) => {
+                                tracing::info!("Crypto middleware returned PassThrough (no encrypted events or not applicable)");
                                 pass_body.unwrap_or(body)
                             }
                             crate::matrix::crypto::types::CryptoProcessResult::Error(e) => {
-                                tracing::warn!("Crypto middleware error: {}", e);
+                                tracing::warn!("Crypto middleware error during sync decryption: {}", e);
                                 body
                             }
                         }
                     } else {
+                        tracing::error!("Crypto thread channel recv failed — falling back to raw sync body");
                         body
                     }
                 } else {
@@ -728,6 +744,12 @@ impl WasmChannel {
     /// Initialize the Matrix crypto middleware if encryption is enabled.
     #[cfg(feature = "matrix-e2ee")]
     async fn initialize_crypto_middleware(&self) -> Result<(), String> {
+        tracing::info!(
+            channel = %self.name,
+            encryption_enabled = %self.capabilities.encryption,
+            "E2EE crypto middleware init check"
+        );
+
         if !self.capabilities.encryption {
             tracing::debug!(
                 channel = %self.name,
@@ -738,10 +760,10 @@ impl WasmChannel {
 
         tracing::info!(
             channel = %self.name,
-            "Initializing Matrix crypto middleware"
+            "Initializing Matrix crypto middleware (encryption=true in capabilities)"
         );
 
-        // Get Matrix credentials from channel config
+        // Get homeserver and user_id from channel config
         let config_guard = self.config_json.read().await;
         let config: HashMap<String, serde_json::Value> =
             serde_json::from_str(&config_guard).map_err(|e| e.to_string())?;
@@ -756,10 +778,26 @@ impl WasmChannel {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Matrix homeserver not found in channel config".to_string())?;
 
-        let access_token = config
-            .get("access_token")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "Matrix access_token not found in channel config".to_string())?;
+        // Read access token from injected credentials (not config — config uses placeholders)
+        let credentials = self.get_credentials().await;
+        let access_token = credentials
+            .get("MATRIX_ACCESS_TOKEN")
+            .ok_or_else(|| {
+                tracing::error!(
+                    channel = %self.name,
+                    available_credentials = ?credentials.keys().collect::<Vec<_>>(),
+                    "MATRIX_ACCESS_TOKEN not found in injected credentials"
+                );
+                "MATRIX_ACCESS_TOKEN credential not injected — cannot initialize E2EE".to_string()
+            })?;
+
+        tracing::info!(
+            channel = %self.name,
+            user_id = %user_id,
+            homeserver = %homeserver,
+            access_token_len = access_token.len(),
+            "Crypto middleware config resolved successfully"
+        );
 
         drop(config_guard);
 
@@ -2104,6 +2142,13 @@ impl Channel for WasmChannel {
         // Initialize Matrix crypto middleware if encryption is enabled
         #[cfg(feature = "matrix-e2ee")]
         {
+            let cred_count = self.credentials.read().await.len();
+            tracing::info!(
+                channel = %self.name,
+                encryption_cap = %self.capabilities.encryption,
+                credential_count = cred_count,
+                "About to initialize crypto middleware"
+            );
             self.initialize_crypto_middleware().await.map_err(|e| {
                 ChannelError::StartupFailed {
                     name: self.name.clone(),

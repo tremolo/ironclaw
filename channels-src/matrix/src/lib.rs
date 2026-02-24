@@ -621,6 +621,16 @@ fn process_timeline_event(
     );
 
     // Only process m.room.message events with msgtype m.text
+    if event.event_type == "m.room.encrypted" {
+        channel_host::log(
+            channel_host::LogLevel::Warn,
+            &format!(
+                "Received m.room.encrypted event in room {} from {} — E2EE crypto middleware may not be active, message cannot be processed",
+                room_id, event.sender
+            ),
+        );
+        return;
+    }
     if event.event_type != "m.room.message" {
         channel_host::log(
             channel_host::LogLevel::Debug,
