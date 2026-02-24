@@ -1342,13 +1342,14 @@ impl WasmChannel {
 
         let runtime = Arc::clone(&self.runtime);
         let prepared = Arc::clone(&self.prepared);
-        let capabilities = self.capabilities.clone();
+        let capabilities = Self::inject_workspace_reader(&self.capabilities, &self.workspace_store);
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
         let pairing_store = self.pairing_store.clone();
         #[cfg(feature = "matrix-e2ee")]
         let crypto_state = self.crypto_state.clone();
+        let workspace_store = self.workspace_store.clone();
 
         // Prepare response data
         let message_id_str = message_id.to_string();
@@ -1410,8 +1411,13 @@ impl WasmChannel {
                     });
                 }
 
-                let host_state =
+                let mut host_state =
                     Self::extract_host_state(&mut store, &prepared.name, &capabilities);
+
+                // Commit any pending workspace writes
+                let pending_writes = host_state.take_pending_writes();
+                workspace_store.commit_writes(&pending_writes);
+
                 tracing::info!("on_respond WASM execution completed successfully");
                 Ok(((), host_state))
             })
