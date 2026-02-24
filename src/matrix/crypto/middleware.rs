@@ -645,9 +645,9 @@ impl MatrixCryptoMiddleware {
     async fn send_verification_outgoing(
         &self,
         olm: &OlmMachineWrapper,
-        request: matrix_sdk_crypto::OutgoingVerificationRequest,
+        request: matrix_sdk_crypto::types::requests::OutgoingVerificationRequest,
     ) {
-        use matrix_sdk_crypto::OutgoingVerificationRequest;
+        use matrix_sdk_crypto::types::requests::OutgoingVerificationRequest;
         use ruma::api::{
             IncomingResponse,
             client::to_device::send_event_to_device::v3::Response as ToDeviceResponse,
