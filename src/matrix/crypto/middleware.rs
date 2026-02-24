@@ -713,6 +713,16 @@ impl MatrixCryptoMiddleware {
                     }
                 };
 
+            // Append access_token as query parameter (Bearer header auth is not
+            // universally supported by all homeserver implementations; query-param
+            // auth matches how the WASM channel authenticates and is more
+            // broadly compatible).
+            let authed_url = if url.contains('?') {
+                format!("{}&access_token={}", url, self.config.identity.access_token)
+            } else {
+                format!("{}?access_token={}", url, self.config.identity.access_token)
+            };
+
             tracing::debug!(
                 method = %method_str,
                 url = %url,
@@ -720,19 +730,15 @@ impl MatrixCryptoMiddleware {
                 "Sending crypto request"
             );
 
-            // Send the HTTP request with auth header.
+            // Send the HTTP request with query-param auth.
             let result = self
                 .http_client
                 .request(
                     reqwest::Method::from_bytes(method_str.as_bytes())
                         .unwrap_or(reqwest::Method::POST),
-                    &url,
+                    &authed_url,
                 )
                 .header("Content-Type", "application/json")
-                .header(
-                    "Authorization",
-                    format!("Bearer {}", self.config.identity.access_token),
-                )
                 .body(body_bytes)
                 .send()
                 .await;
@@ -1130,16 +1136,13 @@ impl MatrixCryptoMiddleware {
         // URL-encode the room ID: '!' → '%21', ':' → '%3A' to be path-safe.
         let encoded_room_id = room_id.replace('!', "%21").replace(':', "%3A");
         let url = format!(
-            "{base_url}/_matrix/client/v3/rooms/{encoded_room_id}/members?membership=join"
+            "{base_url}/_matrix/client/v3/rooms/{encoded_room_id}/members?membership=join&access_token={}",
+            self.config.identity.access_token
         );
 
         let result = self
             .http_client
             .get(&url)
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.config.identity.access_token),
-            )
             .send()
             .await;
 
