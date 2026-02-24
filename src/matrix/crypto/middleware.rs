@@ -560,8 +560,166 @@ impl MatrixCryptoMiddleware {
             tracing::error!(error = %e, "Failed to process sync crypto changes");
         }
 
+        // Handle any incoming verification requests (accept + auto-confirm SAS).
+        self.handle_verifications(olm).await;
+
         // Drain any pending outgoing requests (key uploads, key claims, etc.)
         self.send_outgoing_requests(&olm).await;
+    }
+
+    /// Handle incoming cross-signing verification requests and drive the SAS flow.
+    ///
+    /// Automatically:
+    /// 1. Accepts incoming verification requests (sends `m.key.verification.ready`)
+    /// 2. Confirms SAS emoji matches once keys are exchanged (auto-trusts, no emoji check)
+    ///
+    /// The user triggers the flow from Element (click IRONCLAW_bot → Verify), sees the
+    /// emoji on their side, and confirms. The bot silently confirms its side.
+    #[cfg(feature = "matrix-e2ee")]
+    async fn handle_verifications(&self, olm: &OlmMachineWrapper) {
+        use matrix_sdk_crypto::Verification;
+
+        let machine = olm.machine();
+        let user_id = match ruma::UserId::parse(olm.user_id()) {
+            Ok(id) => id,
+            Err(_) => return,
+        };
+
+        let requests = machine.get_verification_requests(&user_id);
+        if !requests.is_empty() {
+            tracing::info!(count = requests.len(), "Processing verification requests");
+        }
+
+        for request in &requests {
+            if request.is_cancelled() || request.is_done() {
+                continue;
+            }
+
+            let other_user = request.other_user().to_string();
+            let flow_id = request.flow_id().as_str().to_string();
+
+            // Step 1: Not yet accepted — send m.key.verification.ready
+            if !request.is_ready() {
+                if let Some(outgoing) = request.accept() {
+                    tracing::info!(
+                        other_user = %other_user,
+                        flow_id = %flow_id,
+                        "Accepting incoming verification request"
+                    );
+                    self.send_verification_outgoing(olm, outgoing).await;
+                }
+                // Wait for next sync to receive m.key.verification.start from the other side
+                continue;
+            }
+
+            // Step 2: SAS keys exchanged — auto-confirm (bot trusts all incoming verifications)
+            if let Some(Verification::SasV1(sas)) = machine.get_verification(&user_id, &flow_id) {
+                if sas.can_be_presented() && !sas.have_we_confirmed() {
+                    tracing::info!(
+                        other_user = %other_user,
+                        flow_id = %flow_id,
+                        "Auto-confirming SAS verification (bot side)"
+                    );
+                    match sas.confirm().await {
+                        Ok((outgoing_requests, sig_upload)) => {
+                            for r in outgoing_requests {
+                                self.send_verification_outgoing(olm, r).await;
+                            }
+                            // sig_upload signs the other device's key — flush it via outgoing_requests()
+                            if sig_upload.is_some() {
+                                self.send_outgoing_requests(olm).await;
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, flow_id = %flow_id, "Failed to confirm SAS"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Send a single `OutgoingVerificationRequest` (to-device only) to the homeserver.
+    ///
+    /// After sending, marks the request as sent so the OlmMachine's verification
+    /// state machine can advance to the next step.
+    #[cfg(feature = "matrix-e2ee")]
+    async fn send_verification_outgoing(
+        &self,
+        olm: &OlmMachineWrapper,
+        request: matrix_sdk_crypto::OutgoingVerificationRequest,
+    ) {
+        use matrix_sdk_crypto::OutgoingVerificationRequest;
+        use ruma::api::{
+            IncomingResponse,
+            client::to_device::send_event_to_device::v3::Response as ToDeviceResponse,
+        };
+
+        let to_device = match request {
+            OutgoingVerificationRequest::ToDevice(r) => r,
+            OutgoingVerificationRequest::InRoom(_) => {
+                tracing::debug!("Skipping in-room verification request (not supported)");
+                return;
+            }
+        };
+
+        let txn_id = to_device.txn_id.clone();
+        let base_url = self.config.identity.homeserver.trim_end_matches('/');
+        let url = format!(
+            "{base_url}/_matrix/client/v3/sendToDevice/{}/{}?access_token={}",
+            to_device.event_type,
+            to_device.txn_id,
+            self.config.identity.access_token,
+        );
+
+        let body = serde_json::json!({ "messages": to_device.messages });
+        let body_bytes = match serde_json::to_vec(&body) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to serialize verification to-device");
+                return;
+            }
+        };
+
+        tracing::debug!(
+            event_type = %to_device.event_type,
+            "Sending verification to-device event"
+        );
+
+        let result = self
+            .http_client
+            .put(&url)
+            .header("Content-Type", "application/json")
+            .body(body_bytes)
+            .send()
+            .await;
+
+        let (status, response_bytes) = match result {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let bytes = response.bytes().await.unwrap_or_default().to_vec();
+                tracing::debug!(status = status, "Verification to-device sent");
+                (status, bytes)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to send verification to-device");
+                return;
+            }
+        };
+
+        // Mark as sent so the OlmMachine verification state machine advances.
+        if let Some(http_resp) = http::Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(response_bytes)
+            .ok()
+        {
+            if let Ok(typed_resp) =
+                <ToDeviceResponse as IncomingResponse>::try_from_http_response(http_resp)
+            {
+                if let Err(e) = olm.mark_request_as_sent(&txn_id, &typed_resp).await {
+                    tracing::warn!(error = %e, "mark_request_as_sent failed for verification");
+                }
+            }
+        }
     }
 
     /// Send pending outgoing requests to the homeserver and mark them as sent.
