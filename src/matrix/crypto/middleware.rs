@@ -616,13 +616,31 @@ impl MatrixCryptoMiddleware {
                     AnyOutgoingRequest::KeysUpload(r) => {
                         let url =
                             format!("{base_url}/_matrix/client/v3/keys/upload");
-                        // Serialize only the body fields (device_keys, one_time_keys, fallback_keys)
-                        let body = serde_json::json!({
-                            "device_keys": r.device_keys,
-                            "one_time_keys": r.one_time_keys,
-                            "fallback_keys": r.fallback_keys,
-                        });
-                        match serde_json::to_vec(&body) {
+                        // Only include device_keys when the OlmMachine actually has new keys
+                        // to publish (i.e., first registration or re-registration).
+                        // Sending `"device_keys": null` can cause some homeservers (e.g.
+                        // Conduit/Conduwuit) to clear the stored identity keys, which makes
+                        // the device appear as "doesn't support encryption" to other clients
+                        // and breaks room key distribution.
+                        let mut body = serde_json::Map::new();
+                        if let Some(device_keys) = &r.device_keys {
+                            match serde_json::to_value(device_keys) {
+                                Ok(v) => { body.insert("device_keys".into(), v); }
+                                Err(e) => tracing::warn!(error = %e, "Failed to serialize device_keys"),
+                            }
+                        }
+                        if let Ok(v) = serde_json::to_value(&r.one_time_keys) {
+                            body.insert("one_time_keys".into(), v);
+                        }
+                        if let Ok(v) = serde_json::to_value(&r.fallback_keys) {
+                            body.insert("fallback_keys".into(), v);
+                        }
+                        tracing::debug!(
+                            has_device_keys = r.device_keys.is_some(),
+                            otk_count = r.one_time_keys.len(),
+                            "KeysUpload request"
+                        );
+                        match serde_json::to_vec(&serde_json::Value::Object(body)) {
                             Ok(b) => ("POST", url, b),
                             Err(e) => {
                                 tracing::warn!(error = %e, "Failed to serialize KeysUpload request");
