@@ -402,72 +402,136 @@ impl MatrixCryptoMiddleware {
     }
 
     /// Process to-device events from sync response for key exchange.
+    ///
+    /// Feeds to-device events, device list changes, and one-time key counts
+    /// to the OlmMachine so it can learn about new room keys and manage
+    /// Olm sessions.
     #[cfg(feature = "matrix-e2ee")]
     async fn process_to_device_events(&mut self, sync_response: &serde_json::Value) {
+        use std::collections::BTreeMap;
+        use ruma::serde::Raw;
+        use ruma::events::AnyToDeviceEvent;
+        use ruma::api::client::sync::sync_events::DeviceLists;
+        use ruma::{OneTimeKeyAlgorithm, UInt};
+
         let olm = match &self.olm {
             Some(m) => m,
             None => return,
         };
 
-        // Extract to-device events
-        let to_device = match sync_response.get("to_device") {
-            Some(v) => v,
-            None => return,
-        };
+        // --- Extract to-device events ---
+        let to_device_events: Vec<Raw<AnyToDeviceEvent>> = sync_response
+            .get("to_device")
+            .and_then(|v| v.get("events"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|ev| {
+                        serde_json::value::to_raw_value(ev)
+                            .ok()
+                            .map(|raw| Raw::from_json(raw))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        let events = match to_device.get("events") {
-            Some(v) => v,
-            None => return,
-        };
-
-        let events_array = match events.as_array() {
-            Some(a) => a,
-            None => return,
-        };
-
-        if events_array.is_empty() {
-            return;
-        }
-
-        tracing::debug!(
-            to_device_count = events_array.len(),
-            "Processing to-device events for key exchange"
-        );
-
-        // Extract device list changes
-        let device_lists = sync_response.get("device_lists");
-        let changed: Vec<String> = device_lists
+        // --- Extract device list changes ---
+        let device_lists_json = sync_response.get("device_lists");
+        let changed: Vec<ruma::OwnedUserId> = device_lists_json
             .and_then(|d| d.get("changed"))
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
+                    .filter_map(|v| v.as_str())
+                    .filter_map(|s| ruma::UserId::parse(s).ok())
                     .collect()
             })
             .unwrap_or_default();
 
-        let left: Vec<String> = device_lists
+        let left: Vec<ruma::OwnedUserId> = device_lists_json
             .and_then(|d| d.get("left"))
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
+                    .filter_map(|v| v.as_str())
+                    .filter_map(|s| ruma::UserId::parse(s).ok())
                     .collect()
             })
             .unwrap_or_default();
 
-        if !changed.is_empty() {
-            tracing::debug!(changed_count = changed.len(), "Device lists changed");
+        let mut device_lists = DeviceLists::new();
+        device_lists.changed = changed;
+        device_lists.left = left;
+
+        // --- Extract one-time key counts ---
+        let one_time_keys_counts: BTreeMap<OneTimeKeyAlgorithm, UInt> = sync_response
+            .get("device_one_time_keys_count")
+            .and_then(|v| v.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| {
+                        let algo = OneTimeKeyAlgorithm::from(k.as_str());
+                        let count = v.as_u64().and_then(|n| UInt::try_from(n).ok())?;
+                        Some((algo, count))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // --- Extract unused fallback key types ---
+        let unused_fallback_keys_vec: Vec<OneTimeKeyAlgorithm> = sync_response
+            .get("device_unused_fallback_key_types")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| OneTimeKeyAlgorithm::from(s))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // --- Extract next_batch ---
+        let next_batch_token = sync_response
+            .get("next_batch")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        tracing::info!(
+            to_device_count = to_device_events.len(),
+            changed_devices = device_lists.changed.len(),
+            left_devices = device_lists.left.len(),
+            otk_counts = one_time_keys_counts.len(),
+            unused_fallback_keys = unused_fallback_keys_vec.len(),
+            next_batch = ?next_batch_token,
+            "Feeding sync crypto data to OlmMachine"
+        );
+
+        // --- Feed everything to OlmMachine ---
+        let sync_changes = matrix_sdk_crypto::EncryptionSyncChanges {
+            to_device_events,
+            changed_devices: &device_lists,
+            one_time_keys_counts: &one_time_keys_counts,
+            unused_fallback_keys: Some(&unused_fallback_keys_vec),
+            next_batch_token,
+        };
+
+        if let Err(e) = olm.receive_sync_changes(sync_changes).await {
+            tracing::error!(error = %e, "Failed to process sync crypto changes");
         }
 
-        if !left.is_empty() {
-            tracing::debug!(left_count = left.len(), "Device lists left");
-        }
-
-        // For now, just drain any pending outgoing requests
-        // TODO: properly deserialize to-device events and call receive_sync_changes
-        if let Err(e) = olm.outgoing_requests().await {
-            tracing::warn!(error = %e, "Failed to get outgoing requests");
+        // Drain any pending outgoing requests (key uploads, key claims, etc.)
+        match olm.outgoing_requests().await {
+            Ok(requests) if !requests.is_empty() => {
+                tracing::info!(
+                    request_count = requests.len(),
+                    "OlmMachine has pending outgoing requests (key uploads/claims)"
+                );
+                // TODO: send these requests to the homeserver and call mark_request_as_sent
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to get outgoing requests");
+            }
         }
     }
 
