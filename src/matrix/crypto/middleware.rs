@@ -598,23 +598,47 @@ impl MatrixCryptoMiddleware {
             let other_user = request.other_user().to_string();
             let flow_id = request.flow_id().as_str().to_string();
 
-            // Step 1: Not yet accepted — send m.key.verification.ready
+            // Step 1: Request not yet accepted (InnerRequest::Requested state).
+            // accept() returns Some only when in Requested state; returns None for
+            // Ready/Transitioned/Passive/Done/Cancelled — so it's safe to call always.
             if !request.is_ready() {
                 if let Some(outgoing) = request.accept() {
                     tracing::info!(
                         other_user = %other_user,
                         flow_id = %flow_id,
-                        "Accepting incoming verification request"
+                        "Accepting incoming verification request (sending ready)"
                     );
                     self.send_verification_outgoing(olm, outgoing).await;
+                    // Just sent ready; Element will send start on next sync — skip SAS check.
+                    continue;
                 }
-                // Wait for next sync to receive m.key.verification.start from the other side
-                continue;
+                // accept() returned None: request is in Transitioned state (start received).
+                // Fall through to handle the SAS object below.
             }
 
-            // Step 2: SAS keys exchanged — auto-confirm (bot trusts all incoming verifications)
+            // Steps 2a/2b: Drive the SAS state machine.
             if let Some(Verification::SasV1(sas)) = machine.get_verification(&user_id, &flow_id) {
-                if sas.can_be_presented() && !sas.have_we_confirmed() {
+                if sas.is_done() || sas.is_cancelled() {
+                    continue;
+                }
+
+                // Step 2a: SAS started (received m.key.verification.start) but not yet accepted.
+                // sas.accept() returns Some only in SasState::Started; idempotent otherwise.
+                if !sas.has_been_accepted() {
+                    if let Some(outgoing) = sas.accept() {
+                        tracing::info!(
+                            other_user = %other_user,
+                            flow_id = %flow_id,
+                            "Accepting SAS method (sending m.key.verification.accept)"
+                        );
+                        self.send_verification_outgoing(olm, outgoing).await;
+                        // Key exchange happens automatically via the internal queue when
+                        // the OlmMachine receives/processes the counterpart's key event.
+                    }
+                }
+                // Step 2b: Both sides have exchanged keys — auto-confirm.
+                // (sas.confirm() also handles the case where we already confirmed.)
+                else if sas.can_be_presented() && !sas.have_we_confirmed() {
                     tracing::info!(
                         other_user = %other_user,
                         flow_id = %flow_id,
@@ -625,7 +649,8 @@ impl MatrixCryptoMiddleware {
                             for r in outgoing_requests {
                                 self.send_verification_outgoing(olm, r).await;
                             }
-                            // sig_upload signs the other device's key — flush it via outgoing_requests()
+                            // sig_upload signs the other device's cross-signing key.
+                            // Flush it through the standard outgoing_requests queue.
                             if sig_upload.is_some() {
                                 self.send_outgoing_requests(olm).await;
                             }
