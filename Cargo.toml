@@ -129,6 +129,7 @@ wasmparser = "0.220"  # WASM binary parsing for validation
 matrix-sdk-crypto = { version = "0.16", optional = true, default-features = false }
 matrix-sdk-sqlite = { version = "0.16", optional = true, default-features = false, features = ["crypto-store"] }
 ruma = { version = "0.14", optional = true, default-features = false, features = ["client-api-c"] }
+http = { version = "1", optional = true }
 
 # Cryptography for secrets management
 aes-gcm = "0.10"
@@ -188,7 +189,7 @@ postgres = [
     "rust_decimal/db-tokio-postgres",
 ]
 libsql = ["dep:libsql"]
-matrix-e2ee = ["dep:matrix-sdk-crypto", "dep:matrix-sdk-sqlite", "dep:ruma"]
+matrix-e2ee = ["dep:matrix-sdk-crypto", "dep:matrix-sdk-sqlite", "dep:ruma", "dep:http"]
 integration = []
 html-to-markdown = ["dep:html-to-markdown-rs", "dep:readabilityrs"]
 

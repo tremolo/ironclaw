@@ -27,6 +27,10 @@ pub struct MatrixCryptoMiddleware {
 
     /// Configuration.
     config: MatrixCryptoConfig,
+
+    /// HTTP client for sending crypto-related requests.
+    #[cfg(feature = "matrix-e2ee")]
+    http_client: reqwest::Client,
 }
 
 impl MatrixCryptoMiddleware {
@@ -39,10 +43,16 @@ impl MatrixCryptoMiddleware {
             "Creating MatrixCryptoMiddleware"
         );
 
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
         Ok(Self {
             olm: None,
             room_states: RoomEncryptionCache::new(),
             config,
+            http_client,
         })
     }
 
@@ -59,6 +69,9 @@ impl MatrixCryptoMiddleware {
     /// Initialize the Olm machine.
     ///
     /// This should be called after creation, before processing any requests.
+    /// After creating the OlmMachine, any pending outgoing requests (most
+    /// importantly the initial device key upload) are drained immediately so
+    /// the device is registered on the homeserver before the first /sync poll.
     #[cfg(feature = "matrix-e2ee")]
     pub async fn initialize(&mut self) -> Result<(), String> {
         tracing::info!("Initializing OlmMachine");
@@ -73,7 +86,19 @@ impl MatrixCryptoMiddleware {
         .map_err(|e| e.to_string())?;
 
         self.olm = Some(olm);
-        tracing::info!("OlmMachine initialized successfully");
+        tracing::info!("OlmMachine initialized successfully — draining initial outgoing requests (device key upload)");
+
+        // Restore room encryption states persisted from a previous run so we
+        // don't send plaintext in rooms that were already known to be encrypted.
+        self.load_room_states();
+
+        // Drain any requests generated during initialization (device key upload,
+        // one-time key upload).  These must reach the homeserver before the first
+        // /sync so that other devices can see and encrypt to this device.
+        if let Some(olm) = &self.olm {
+            self.send_outgoing_requests(olm).await;
+        }
+
         Ok(())
     }
 
@@ -373,6 +398,9 @@ impl MatrixCryptoMiddleware {
         // Update room encryption states from state events
         self.update_room_states(&sync_response);
 
+        // Persist updated room states so they survive restarts.
+        self.persist_room_states();
+
         // Process to-device events for key exchange
         self.process_to_device_events(&sync_response).await;
 
@@ -520,17 +548,264 @@ impl MatrixCryptoMiddleware {
         }
 
         // Drain any pending outgoing requests (key uploads, key claims, etc.)
-        match olm.outgoing_requests().await {
-            Ok(requests) if !requests.is_empty() => {
-                tracing::info!(
-                    request_count = requests.len(),
-                    "OlmMachine has pending outgoing requests (key uploads/claims)"
-                );
-                // TODO: send these requests to the homeserver and call mark_request_as_sent
-            }
-            Ok(_) => {}
+        self.send_outgoing_requests(&olm).await;
+    }
+
+    /// Send pending outgoing requests to the homeserver and mark them as sent.
+    ///
+    /// For each request from the OlmMachine, this function:
+    /// 1. Converts the typed request to an HTTP method/URL/body
+    /// 2. Sends it to the homeserver with the Bearer auth header
+    /// 3. Parses the response into the correct typed ruma response struct
+    /// 4. Calls `mark_request_as_sent` so the OlmMachine can update its internal state
+    #[cfg(feature = "matrix-e2ee")]
+    async fn send_outgoing_requests(&self, olm: &OlmMachineWrapper) {
+        use matrix_sdk_crypto::types::requests::AnyOutgoingRequest;
+        use ruma::api::{
+            IncomingResponse,
+            client::{
+                keys::{
+                    claim_keys::v3::Response as KeysClaimResponse,
+                    get_keys::v3::Response as KeysQueryResponse,
+                    upload_keys::v3::Response as KeysUploadResponse,
+                    upload_signatures::v3::Response as SignatureUploadResponse,
+                },
+                message::send_message_event::v3::Response as RoomMessageResponse,
+                to_device::send_event_to_device::v3::Response as ToDeviceResponse,
+            },
+        };
+
+        let requests = match olm.outgoing_requests().await {
+            Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to get outgoing requests");
+                return;
+            }
+        };
+
+        if requests.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            request_count = requests.len(),
+            "Sending outgoing crypto requests to homeserver"
+        );
+
+        let base_url = self.config.identity.homeserver.trim_end_matches('/');
+
+        for request in &requests {
+            let request_id = request.request_id();
+
+            // Build the HTTP method, full URL, and serialized body for this request.
+            let (method_str, url, body_bytes): (&str, String, Vec<u8>) =
+                match request.request() {
+                    AnyOutgoingRequest::KeysUpload(r) => {
+                        let url =
+                            format!("{base_url}/_matrix/client/v3/keys/upload");
+                        // Serialize only the body fields (device_keys, one_time_keys, fallback_keys)
+                        let body = serde_json::json!({
+                            "device_keys": r.device_keys,
+                            "one_time_keys": r.one_time_keys,
+                            "fallback_keys": r.fallback_keys,
+                        });
+                        match serde_json::to_vec(&body) {
+                            Ok(b) => ("POST", url, b),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Failed to serialize KeysUpload request");
+                                continue;
+                            }
+                        }
+                    }
+                    AnyOutgoingRequest::KeysQuery(r) => {
+                        let url =
+                            format!("{base_url}/_matrix/client/v3/keys/query");
+                        // KeysQueryRequest is a custom matrix-sdk-crypto type (not a ruma type).
+                        // Serialize its fields manually.
+                        let mut obj = serde_json::Map::new();
+                        if let Ok(device_keys) = serde_json::to_value(&r.device_keys) {
+                            obj.insert("device_keys".into(), device_keys);
+                        }
+                        if let Some(timeout) = r.timeout {
+                            obj.insert(
+                                "timeout".into(),
+                                serde_json::Value::Number(
+                                    (timeout.as_millis() as u64).into(),
+                                ),
+                            );
+                        }
+                        match serde_json::to_vec(&serde_json::Value::Object(obj)) {
+                            Ok(b) => ("POST", url, b),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Failed to serialize KeysQuery request");
+                                continue;
+                            }
+                        }
+                    }
+                    AnyOutgoingRequest::KeysClaim(r) => {
+                        let url =
+                            format!("{base_url}/_matrix/client/v3/keys/claim");
+                        let mut obj = serde_json::Map::new();
+                        if let Ok(one_time_keys) = serde_json::to_value(&r.one_time_keys) {
+                            obj.insert("one_time_keys".into(), one_time_keys);
+                        }
+                        if let Some(timeout) = r.timeout {
+                            obj.insert(
+                                "timeout".into(),
+                                serde_json::Value::Number(
+                                    (timeout.as_millis() as u64).into(),
+                                ),
+                            );
+                        }
+                        match serde_json::to_vec(&serde_json::Value::Object(obj)) {
+                            Ok(b) => ("POST", url, b),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Failed to serialize KeysClaim request");
+                                continue;
+                            }
+                        }
+                    }
+                    AnyOutgoingRequest::ToDeviceRequest(r) => {
+                        // PUT /_matrix/client/v3/sendToDevice/{event_type}/{txn_id}
+                        let url = format!(
+                            "{base_url}/_matrix/client/v3/sendToDevice/{}/{}",
+                            r.event_type, r.txn_id
+                        );
+                        // Body: {"messages": { user_id: { device_id: content } }}
+                        let body = serde_json::json!({ "messages": r.messages });
+                        match serde_json::to_vec(&body) {
+                            Ok(b) => ("PUT", url, b),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Failed to serialize ToDevice request");
+                                continue;
+                            }
+                        }
+                    }
+                    AnyOutgoingRequest::SignatureUpload(r) => {
+                        let url = format!(
+                            "{base_url}/_matrix/client/v3/keys/signatures/upload"
+                        );
+                        // Body is the signed_keys map directly (not wrapped)
+                        match serde_json::to_vec(&r.signed_keys) {
+                            Ok(b) => ("POST", url, b),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Failed to serialize SignatureUpload request");
+                                continue;
+                            }
+                        }
+                    }
+                    AnyOutgoingRequest::RoomMessage(r) => {
+                        use ruma::events::MessageLikeEventContent as _;
+                        // PUT /_matrix/client/v3/rooms/{room_id}/send/{event_type}/{txn_id}
+                        let url = format!(
+                            "{base_url}/_matrix/client/v3/rooms/{}/send/{}/{}",
+                            r.room_id,
+                            r.content.event_type(),
+                            r.txn_id
+                        );
+                        match serde_json::to_vec(r.content.as_ref()) {
+                            Ok(b) => ("PUT", url, b),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Failed to serialize RoomMessage request");
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+            tracing::debug!(
+                method = %method_str,
+                url = %url,
+                body_len = body_bytes.len(),
+                "Sending crypto request"
+            );
+
+            // Send the HTTP request with auth header.
+            let result = self
+                .http_client
+                .request(
+                    reqwest::Method::from_bytes(method_str.as_bytes())
+                        .unwrap_or(reqwest::Method::POST),
+                    &url,
+                )
+                .header("Content-Type", "application/json")
+                .header(
+                    "Authorization",
+                    format!("Bearer {}", self.config.identity.access_token),
+                )
+                .body(body_bytes)
+                .send()
+                .await;
+
+            let (status, response_bytes) = match result {
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    let bytes = response.bytes().await.unwrap_or_default().to_vec();
+                    tracing::debug!(
+                        request_id = %request_id,
+                        status = status,
+                        response_len = bytes.len(),
+                        "Crypto request response received"
+                    );
+                    (status, bytes)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        request_id = %request_id,
+                        error = %e,
+                        "Failed to send crypto request"
+                    );
+                    continue;
+                }
+            };
+
+            // Build an http::Response so ruma's try_from_http_response can parse it.
+            let make_http_resp = || -> Option<http::Response<Vec<u8>>> {
+                http::Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .body(response_bytes.clone())
+                    .ok()
+            };
+
+            // Parse the response into the correct typed struct and mark the request as sent.
+            macro_rules! mark_sent {
+                ($ResponseType:ty) => {{
+                    if let Some(http_resp) = make_http_resp() {
+                        match <$ResponseType as IncomingResponse>::try_from_http_response(http_resp) {
+                            Ok(resp) => {
+                                if let Err(e) =
+                                    olm.mark_request_as_sent(request_id, &resp).await
+                                {
+                                    tracing::warn!(
+                                        request_id = %request_id,
+                                        error = %e,
+                                        "mark_request_as_sent failed"
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        request_id = %request_id,
+                                        "Request marked as sent"
+                                    );
+                                }
+                            }
+                            Err(e) => tracing::warn!(
+                                request_id = %request_id,
+                                error = %e,
+                                "Failed to parse crypto response"
+                            ),
+                        }
+                    }
+                }};
+            }
+
+            match request.request() {
+                AnyOutgoingRequest::KeysUpload(_) => mark_sent!(KeysUploadResponse),
+                AnyOutgoingRequest::KeysQuery(_) => mark_sent!(KeysQueryResponse),
+                AnyOutgoingRequest::KeysClaim(_) => mark_sent!(KeysClaimResponse),
+                AnyOutgoingRequest::ToDeviceRequest(_) => mark_sent!(ToDeviceResponse),
+                AnyOutgoingRequest::SignatureUpload(_) => mark_sent!(SignatureUploadResponse),
+                AnyOutgoingRequest::RoomMessage(_) => mark_sent!(RoomMessageResponse),
             }
         }
     }
@@ -725,43 +1000,217 @@ impl MatrixCryptoMiddleware {
     pub fn config(&self) -> &MatrixCryptoConfig {
         &self.config
     }
-    
+
+    /// Persist room encryption states to disk.
+    ///
+    /// Saves `room_states` to a JSON sidecar file next to the crypto store so
+    /// the middleware knows which rooms are encrypted after a restart, without
+    /// waiting for the homeserver to re-send `m.room.encryption` state events.
+    ///
+    /// Errors are logged and swallowed — persistence is best-effort.
+    fn persist_room_states(&self) {
+        let path = self.room_states_path();
+        match serde_json::to_string_pretty(&self.room_states) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    tracing::warn!(path = %path, error = %e, "Failed to persist room encryption states");
+                } else {
+                    tracing::debug!(path = %path, "Persisted room encryption states");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to serialize room encryption states");
+            }
+        }
+    }
+
+    /// Load previously persisted room encryption states from disk.
+    ///
+    /// Called during `initialize()` so the middleware immediately knows which
+    /// rooms were encrypted in previous sessions.
+    ///
+    /// Errors are logged and swallowed — if no file exists the cache starts empty.
+    fn load_room_states(&mut self) {
+        let path = self.room_states_path();
+        match std::fs::read_to_string(&path) {
+            Ok(json) => match serde_json::from_str(&json) {
+                Ok(cache) => {
+                    self.room_states = cache;
+                    tracing::info!(
+                        path = %path,
+                        room_count = self.room_states.encrypted_rooms().len(),
+                        "Loaded persisted room encryption states"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path, error = %e, "Failed to parse persisted room states; starting fresh");
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!(path = %path, "No persisted room states found; starting fresh");
+            }
+            Err(e) => {
+                tracing::warn!(path = %path, error = %e, "Failed to read persisted room states; starting fresh");
+            }
+        }
+    }
+
+    /// Derive the path of the room-state sidecar file from the crypto store path.
+    ///
+    /// E.g. `/path/to/crypto.db` → `/path/to/room_states.json`
+    fn room_states_path(&self) -> String {
+        let store = &self.config.crypto_store_path;
+        // Replace the filename (crypto.db) with room_states.json while keeping
+        // the directory prefix intact.
+        if let Some(slash_pos) = store.rfind('/') {
+            format!("{}/room_states.json", &store[..slash_pos])
+        } else {
+            "room_states.json".to_string()
+        }
+    }
+
     /// Ensure room keys are ready for encryption.
     ///
     /// This handles:
     /// - T14: Key claiming (get_missing_sessions + drain outgoing requests)
     /// - T15: Key query for room members (update_tracked_users)
     /// - T16: Megolm session sharing (share_room_key)
+    ///
+    /// Fetches current room membership so keys are shared with all participants,
+    /// not just own user.
     #[cfg(feature = "matrix-e2ee")]
     async fn ensure_room_keys(
         &mut self,
         room_id: &ruma::RoomId,
     ) -> Result<(), anyhow::Error> {
-        let olm = match &mut self.olm {
+        let olm = match &self.olm {
             Some(m) => m,
             None => return Ok(()),
         };
-        
-        // T14: Check for missing sessions and claim keys if needed
-        // For now, we don't have the user list, so just try to claim
-        // This will be a no-op if no sessions are missing
-        let _has_missing = olm.get_missing_sessions(&[]).await?;
-        
-        // T15: Update tracked users - would need room member list
-        // For now, we track our own user which ensures basic functionality
-        let own_user_id = ruma::UserId::parse(&self.config.identity.user_id)?;
-        olm.update_tracked_users(&[&own_user_id]).await?;
-        
-        // T16: Share room key with recipients
-        // For now, share with our own user (single device scenario)
-        // In multi-device scenario, would share with all room members
-        olm.share_room_key(room_id, &[&own_user_id]).await?;
-        
-        // Drain any outgoing requests (key uploads, to-device messages, etc.)
-        let _requests = olm.outgoing_requests().await?;
-        
-        tracing::debug!(room_id = %room_id, "Room keys prepared for encryption");
+
+        // Fetch current room members so we can share keys with everyone.
+        // Falls back to own user only on error.
+        let members = self.fetch_room_members(room_id.as_str()).await;
+        let member_refs: Vec<&ruma::UserId> = members.iter().map(|u| u.as_ref()).collect();
+
+        // T15: Start tracking device keys for all room members.
+        olm.update_tracked_users(&member_refs).await?;
+
+        // Drain any /keys/query requests generated for newly tracked users.
+        self.send_outgoing_requests(olm).await;
+
+        // T14: Claim one-time keys for members where we don't yet have Olm sessions.
+        let _has_missing = olm.get_missing_sessions(&member_refs).await?;
+
+        // Drain any /keys/claim requests to establish Olm sessions.
+        self.send_outgoing_requests(olm).await;
+
+        // T16: Share the Megolm room key with all room members.
+        olm.share_room_key(room_id, &member_refs).await?;
+
+        // Drain to-device messages carrying the room key share.
+        self.send_outgoing_requests(olm).await;
+
+        tracing::debug!(
+            room_id = %room_id,
+            member_count = members.len(),
+            "Room keys prepared for encryption"
+        );
         Ok(())
+    }
+
+    /// Fetch joined members of a room via the CS API.
+    ///
+    /// Returns user IDs of all members with `membership=join`.
+    /// On any error, returns a list containing only the own user as a safe fallback
+    /// (so encryption still works in the degenerate case).
+    #[cfg(feature = "matrix-e2ee")]
+    async fn fetch_room_members(&self, room_id: &str) -> Vec<ruma::OwnedUserId> {
+        let base_url = self.config.identity.homeserver.trim_end_matches('/');
+        // URL-encode the room ID: '!' → '%21', ':' → '%3A' to be path-safe.
+        let encoded_room_id = room_id.replace('!', "%21").replace(':', "%3A");
+        let url = format!(
+            "{base_url}/_matrix/client/v3/rooms/{encoded_room_id}/members?membership=join"
+        );
+
+        let result = self
+            .http_client
+            .get(&url)
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.config.identity.access_token),
+            )
+            .send()
+            .await;
+
+        let response = match result {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(room_id = %room_id, error = %e, "Failed to send room members request");
+                return self.own_user_id_vec();
+            }
+        };
+
+        if !response.status().is_success() {
+            tracing::warn!(
+                room_id = %room_id,
+                status = %response.status(),
+                "Room members request returned non-success status"
+            );
+            return self.own_user_id_vec();
+        }
+
+        let body: serde_json::Value = match response.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(room_id = %room_id, error = %e, "Failed to parse room members response");
+                return self.own_user_id_vec();
+            }
+        };
+
+        // The response has a "chunk" array of m.room.member state events.
+        // The member's user ID is in the "state_key" field.
+        let chunk = match body.get("chunk").and_then(|c| c.as_array()) {
+            Some(c) => c,
+            None => {
+                tracing::warn!(room_id = %room_id, "Room members response missing 'chunk' field");
+                return self.own_user_id_vec();
+            }
+        };
+
+        let members: Vec<ruma::OwnedUserId> = chunk
+            .iter()
+            .filter_map(|event| {
+                event
+                    .get("state_key")
+                    .and_then(|sk| sk.as_str())
+                    .and_then(|uid| ruma::UserId::parse(uid).ok())
+            })
+            .collect();
+
+        if members.is_empty() {
+            tracing::warn!(room_id = %room_id, "No joined members found; falling back to own user");
+            return self.own_user_id_vec();
+        }
+
+        tracing::debug!(
+            room_id = %room_id,
+            member_count = members.len(),
+            "Fetched room members for key sharing"
+        );
+        members
+    }
+
+    /// Return a single-element Vec containing the own user ID.
+    ///
+    /// Used as a fallback when room member fetching fails, so encryption
+    /// still works at minimum for own devices.
+    #[cfg(feature = "matrix-e2ee")]
+    fn own_user_id_vec(&self) -> Vec<ruma::OwnedUserId> {
+        match ruma::UserId::parse(&self.config.identity.user_id) {
+            Ok(uid) => vec![uid],
+            Err(_) => vec![],
+        }
     }
 }
 
@@ -914,16 +1363,19 @@ mod tests {
 }
 
 /// Check if URL is a Matrix Client-Server API URL.
+#[cfg(test)]
 fn is_matrix_api_url(url: &str) -> bool {
     url.contains("/_matrix/client/")
 }
 
 /// Check if URL is for sending a room message.
+#[cfg(test)]
 fn is_message_send_path(url: &str) -> bool {
     url.contains("/rooms/") && url.contains("/send/m.room.message")
 }
 
 /// Build encrypted event path from message path.
+#[cfg(test)]
 fn build_encrypted_event_path(url: &str) -> String {
     url.replace("/send/m.room.message", "/send/m.room.encrypted")
 }

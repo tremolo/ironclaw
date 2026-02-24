@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 #[allow(unused_imports)]
 use tokio::sync::RwLock;
 
@@ -26,7 +27,7 @@ pub struct MatrixIdentity {
 /// Encryption state for a room.
 ///
 /// Tracks whether a room is encrypted and the encryption algorithm used.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RoomEncryptionState {
     /// Room is not encrypted (plaintext).
     Plaintext,
@@ -54,7 +55,7 @@ impl Default for RoomEncryptionState {
 ///
 /// This is used to quickly look up whether a room is encrypted
 /// when processing messages.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RoomEncryptionCache {
     /// Map from RoomId to encryption state.
     states: HashMap<String, RoomEncryptionState>,
